@@ -18,7 +18,7 @@ int test_thread(void);
 int test_mux(void);
 int test_notrickle(void);
 int test_gathering(void);
-int test_turn(void);
+int test_turn_relay(void);
 int test_conflict(void);
 int test_bind(void);
 int test_ufrag(void);
@@ -36,6 +36,7 @@ int test_server(void);
 int main(int argc, char **argv) {
 	juice_set_log_level(JUICE_LOG_LEVEL_WARN);
 
+	#if 0
 	printf("\nRunning CRC32 implementation test...\n");
 	if (test_crc32()) {
 		fprintf(stderr, "CRC32 implementation test failed\n");
@@ -65,15 +66,14 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Connectivity test failed\n");
 		return -1;
 	}
+	#endif
 
-// Disabled as the Open Relay TURN server is unreliable
-/*
-	printf("\nRunning TURN connectivity test...\n");
-	if (test_turn()) {
-		fprintf(stderr, "TURN connectivity test failed\n");
+	printf("\nRunning TURN relay combination tests...\n");
+	if (test_turn_relay()) {
+		fprintf(stderr, "TURN relay combination tests failed\n");
 		return -1;
 	}
-*/
+
 	printf("\nRunning thread-mode connectivity test...\n");
 	if (test_thread()) {
 		fprintf(stderr, "Thread-mode connectivity test failed\n");

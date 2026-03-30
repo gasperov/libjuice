@@ -33,6 +33,11 @@
 // characteristics of the associated data.
 #define STUN_PACING_TIME 50 // msecs
 
+// Delay before initiating TURN TCP connection, to allow UDP candidates to be explored first
+#define TURN_TCP_CONNECT_DELAY_MS 500
+// Polling interval while waiting for TURN TCP connection to complete
+#define TURN_TCP_CONNECT_POLL_MS 200
+
 // RFC 8445: Agents SHOULD use a Tr value of 15 seconds. Agents MAY use a bigger value but MUST NOT
 // use a value smaller than 15 seconds.
 #define STUN_KEEPALIVE_PERIOD 15000 // msecs
@@ -121,6 +126,8 @@ typedef struct agent_stun_entry {
 	agent_turn_state_t *turn;
 	unsigned int turn_redirections;
 	struct agent_stun_entry *relay_entry;
+	juice_turn_transport_t transport;
+	bool turn_tcp_connect_initiated;
 
 } agent_stun_entry_t;
 
@@ -169,6 +176,8 @@ int agent_set_remote_gathering_done(juice_agent_t *agent);
 int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds);
 int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                       int ds);
+int agent_turn_direct_send(juice_agent_t *agent, const agent_stun_entry_t *entry, const char *data,
+                           size_t size, int ds);
 int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
                      const char *data, size_t size, int ds);
 int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
@@ -217,7 +226,8 @@ int agent_process_turn_data(juice_agent_t *agent, const stun_message_t *msg,
 int agent_process_channel_data(juice_agent_t *agent, agent_stun_entry_t *entry, char *buf,
                                size_t len);
 
-int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t *record);
+int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t *record,
+                                      juice_turn_transport_t turn_transport);
 int agent_add_local_reflexive_candidate(juice_agent_t *agent, ice_candidate_type_t type,
                                         const addr_record_t *record);
 int agent_add_remote_reflexive_candidate(juice_agent_t *agent, ice_candidate_type_t type,

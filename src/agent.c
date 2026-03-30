@@ -59,6 +59,7 @@ static int copy_turn_server(juice_turn_server_t *dst, const juice_turn_server_t 
 	dst->username = alloc_string_copy(src->username, &alloc_failed);
 	dst->password = alloc_string_copy(src->password, &alloc_failed);
 	dst->port = src->port;
+	dst->transport = src->transport;
 
 	if (alloc_failed) {
 		JLOG_FATAL("Memory allocation for TURN server configuration copy failed");
@@ -103,6 +104,7 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 	agent->config.cb_candidate = config->cb_candidate;
 	agent->config.cb_gathering_done = config->cb_gathering_done;
 	agent->config.cb_recv = config->cb_recv;
+	agent->config.cb_candidate_filter = config->cb_candidate_filter;
 	agent->config.user_ptr = config->user_ptr;
 	if (alloc_failed) {
 		JLOG_FATAL("Memory allocation for configuration copy failed");
@@ -260,6 +262,15 @@ int agent_gather_candidates(juice_agent_t *agent) {
 		if (agent->local.candidates_count >= MAX_HOST_CANDIDATES_COUNT) {
 			JLOG_WARN("Local description already has the maximum number of host candidates");
 			break;
+		}
+		if (agent->config.cb_candidate_filter) {
+			char filter_buf[BUFFER_SIZE];
+			if (ice_generate_candidate_sdp(&candidate, filter_buf, BUFFER_SIZE) >= 0 &&
+			    agent->config.cb_candidate_filter(agent, filter_buf, JUICE_TURN_TRANSPORT_UDP, 0,
+			                                      agent->config.user_ptr) != 0) {
+				JLOG_DEBUG("Local host candidate filtered out: %s", filter_buf);
+				continue;
+			}
 		}
 		if (ice_add_candidate(&candidate, &agent->local)) {
 			JLOG_ERROR("Failed to add candidate to local description");
@@ -426,11 +437,16 @@ int agent_resolve_servers(juice_agent_t *agent) {
 					snprintf(entry->turn->credentials.username, STUN_MAX_USERNAME_LEN, "%s",
 					         turn_server->username);
 					entry->turn->password = turn_server->password;
+					entry->transport = turn_server->transport;
+					entry->turn_tcp_connect_initiated = false;
 					juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
 					entry->transaction_id_expired = false;
 					++agent->entries_count;
 
-					agent_arm_transmission(agent, entry, STUN_PACING_TIME * i);
+					if (turn_server->transport == JUICE_TURN_TRANSPORT_TCP)
+						agent_arm_transmission(agent, entry, TURN_TCP_CONNECT_DELAY_MS);
+					else
+						agent_arm_transmission(agent, entry, STUN_PACING_TIME * i);
 
 					++count;
 				}
@@ -585,6 +601,13 @@ int agent_add_remote_candidate(juice_agent_t *agent, const char *sdp) {
 		conn_unlock(agent);
 		return JUICE_ERR_FAILED;
 	}
+	if (agent->config.cb_candidate_filter &&
+	    agent->config.cb_candidate_filter(agent, sdp, JUICE_TURN_TRANSPORT_UDP, 1,
+	                                      agent->config.user_ptr) != 0) {
+		JLOG_DEBUG("Remote candidate filtered out: %s", sdp);
+		conn_unlock(agent);
+		return JUICE_ERR_IGNORED;
+	}
 	ice_candidate_t candidate;
 	int ret = ice_parse_candidate_sdp(sdp, &candidate);
 	if (ret < 0) {
@@ -685,7 +708,13 @@ int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
 
 int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                       int ds) {
-	return conn_send(agent, dst, data, size, ds);
+	return conn_send(agent, dst, data, size, ds, false);
+}
+
+int agent_turn_direct_send(juice_agent_t *agent, const agent_stun_entry_t *entry, const char *data,
+                           size_t size, int ds) {
+	return conn_send(agent, &entry->record, data, size, ds,
+	                 entry->transport == JUICE_TURN_TRANSPORT_TCP);
 }
 
 int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
@@ -720,7 +749,7 @@ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr
 		return -1;
 	}
 
-	return agent_direct_send(agent, &entry->record, buffer, size, ds);
+	return agent_turn_direct_send(agent, entry, buffer, size, ds);
 }
 
 int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *record,
@@ -746,7 +775,7 @@ int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const ad
 		return -1;
 	}
 
-	return agent_direct_send(agent, &entry->record, buffer, len, ds);
+	return agent_turn_direct_send(agent, entry, buffer, len, ds);
 }
 
 juice_state_t agent_get_state(juice_agent_t *agent) {
@@ -922,6 +951,20 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 				if(entry->pair->tcp_state != TCP_STATE_CONNECTED)
 					continue;
+			}
+
+			if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
+			    entry->transport == JUICE_TURN_TRANSPORT_TCP) {
+				if (!conn_turn_tcp_connected(agent)) {
+					if (!entry->turn_tcp_connect_initiated) {
+						JLOG_INFO("Initiating TURN TCP connection after UDP exploration");
+						conn_turn_tcp_connect(agent, &entry->record);
+						entry->turn_tcp_connect_initiated = true;
+					}
+					JLOG_DEBUG("STUN entry %d: Waiting for TURN TCP connection", i);
+					entry->next_transmission = now + TURN_TCP_CONNECT_POLL_MS;
+					continue;
+				}
 			}
 
 			if (entry->retransmissions >= 0) {
@@ -1847,7 +1890,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 		}
 
 		entry->relayed = msg->relayed;
-		if (agent_add_local_relayed_candidate(agent, &msg->relayed)) {
+		if (agent_add_local_relayed_candidate(agent, &msg->relayed, entry->transport)) {
 			JLOG_WARN("Failed to add local relayed candidate from TURN relayed address");
 			return -1;
 		}
@@ -1997,7 +2040,7 @@ int agent_send_turn_allocate_request(juice_agent_t *agent, const agent_stun_entr
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, 0) < 0) {
+	if (agent_turn_direct_send(agent, entry, buffer, size, 0) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2094,7 +2137,7 @@ int agent_send_turn_create_permission_request(juice_agent_t *agent, agent_stun_e
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
+	if (agent_turn_direct_send(agent, entry, buffer, size, ds) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2202,7 +2245,7 @@ int agent_send_turn_channel_bind_request(juice_agent_t *agent, agent_stun_entry_
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
+	if (agent_turn_direct_send(agent, entry, buffer, size, ds) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2260,7 +2303,8 @@ int agent_process_channel_data(juice_agent_t *agent, agent_stun_entry_t *entry, 
 	return agent_input(agent, buf, length, &src, &entry->relayed);
 }
 
-int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t *record) {
+int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t *record,
+                                      juice_turn_transport_t turn_transport) {
 	if (ice_find_candidate_from_addr(&agent->local, record, ICE_CANDIDATE_TYPE_RELAYED)) {
 		JLOG_VERBOSE("The relayed local candidate already exists");
 		return 0;
@@ -2271,10 +2315,6 @@ int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t 
 		JLOG_ERROR("Failed to create relayed candidate");
 		return -1;
 	}
-	if (ice_add_candidate(&candidate, &agent->local)) {
-		JLOG_ERROR("Failed to add candidate to local description");
-		return -1;
-	}
 
 	char buffer[BUFFER_SIZE];
 	if (ice_generate_candidate_sdp(&candidate, buffer, BUFFER_SIZE) < 0) {
@@ -2282,6 +2322,17 @@ int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t 
 		return -1;
 	}
 	JLOG_DEBUG("Gathered relayed candidate: %s", buffer);
+
+	if (agent->config.cb_candidate_filter &&
+	    agent->config.cb_candidate_filter(agent, buffer, turn_transport, 0,
+	                                      agent->config.user_ptr) != 0) {
+		JLOG_DEBUG("Local relayed candidate filtered out: %s", buffer);
+		return 0;
+	}
+	if (ice_add_candidate(&candidate, &agent->local)) {
+		JLOG_ERROR("Failed to add candidate to local description");
+		return -1;
+	}
 
 	// Relayed candidates must be differenciated, so match them with already known remote candidates
 	ice_candidate_t *local = agent->local.candidates + agent->local.candidates_count - 1;
@@ -2322,10 +2373,6 @@ int agent_add_local_reflexive_candidate(juice_agent_t *agent, ice_candidate_type
 		    "Local description has the maximum number of peer reflexive candidates, ignoring");
 		return 0;
 	}
-	if (ice_add_candidate(&candidate, &agent->local)) {
-		JLOG_ERROR("Failed to add candidate to local description");
-		return -1;
-	}
 
 	char buffer[BUFFER_SIZE];
 	if (ice_generate_candidate_sdp(&candidate, buffer, BUFFER_SIZE) < 0) {
@@ -2333,6 +2380,17 @@ int agent_add_local_reflexive_candidate(juice_agent_t *agent, ice_candidate_type
 		return -1;
 	}
 	JLOG_DEBUG("Gathered reflexive candidate: %s", buffer);
+
+	if (agent->config.cb_candidate_filter &&
+	    agent->config.cb_candidate_filter(agent, buffer, JUICE_TURN_TRANSPORT_UDP, 0,
+	                                      agent->config.user_ptr) != 0) {
+		JLOG_DEBUG("Local reflexive candidate filtered out: %s", buffer);
+		return 0;
+	}
+	if (ice_add_candidate(&candidate, &agent->local)) {
+		JLOG_ERROR("Failed to add candidate to local description");
+		return -1;
+	}
 
 	if (type != ICE_CANDIDATE_TYPE_PEER_REFLEXIVE && agent->config.cb_candidate)
 		agent->config.cb_candidate(agent, buffer, agent->config.user_ptr);

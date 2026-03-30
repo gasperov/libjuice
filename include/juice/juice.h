@@ -77,11 +77,27 @@ typedef struct juice_mux_binding_request {
 
 typedef void (*juice_cb_mux_incoming_t)(const juice_mux_binding_request_t *info, void *user_ptr);
 
+typedef enum juice_turn_transport {
+	JUICE_TURN_TRANSPORT_UDP = 0, // default, backward-compatible (zero-init)
+	JUICE_TURN_TRANSPORT_TCP = 1,
+} juice_turn_transport_t;
+
+// Candidate filter callback, called before a candidate is added to the local or remote description.
+// sdp: the SDP string of the candidate (same format as cb_candidate)
+// transport: for local relay candidates, the TURN server transport (TCP or UDP);
+//            JUICE_TURN_TRANSPORT_UDP for all other candidates and all remote candidates
+// is_remote: 0 for local candidates, 1 for remote candidates
+// Return 0 to accept the candidate, non-zero to reject it.
+typedef int (*juice_cb_candidate_filter_t)(juice_agent_t *agent, const char *sdp,
+                                           juice_turn_transport_t transport, int is_remote,
+                                           void *user_ptr);
+
 typedef struct juice_turn_server {
 	const char *host;
 	const char *username;
 	const char *password;
 	uint16_t port;
+	juice_turn_transport_t transport;
 } juice_turn_server_t;
 
 typedef enum juice_concurrency_mode {
@@ -113,6 +129,7 @@ typedef struct juice_config {
 	juice_cb_candidate_t cb_candidate;
 	juice_cb_gathering_done_t cb_gathering_done;
 	juice_cb_recv_t cb_recv;
+	juice_cb_candidate_filter_t cb_candidate_filter;
 
 	void *user_ptr;
 
