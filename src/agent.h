@@ -121,6 +121,7 @@ typedef struct agent_stun_entry {
 	agent_turn_state_t *turn;
 	unsigned int turn_redirections;
 	struct agent_stun_entry *relay_entry;
+	juice_turn_transport_t transport;
 
 } agent_stun_entry_t;
 
@@ -169,6 +170,8 @@ int agent_set_remote_gathering_done(juice_agent_t *agent);
 int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds);
 int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                       int ds);
+int agent_turn_direct_send(juice_agent_t *agent, const agent_stun_entry_t *entry, const char *data,
+                           size_t size, int ds);
 int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
                      const char *data, size_t size, int ds);
 int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,

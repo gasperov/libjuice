@@ -35,6 +35,7 @@ socket_t tcp_create_socket(const addr_record_t *dst) {
 		goto error;
 	}
 
+	JLOG_DEBUG("TCP socket created, non-blocking connect initiated (ret=%d)", ret);
 	return sock;
 
 error:
@@ -141,6 +142,149 @@ int tcp_ice_read(socket_t sock, tcp_ice_read_context_t *context) {
 	context->pending = false;
 	assert(context->length > 0);
 	return (int)context->length;
+}
+
+// Write raw STUN or ChannelData message to TCP socket (no RFC 4571 framing).
+// ChannelData is padded to 4-byte boundary per RFC 8656 Section 12.5.
+int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_stun_write_context_t *context) {
+#if defined(__APPLE__) || defined(_WIN32)
+	int flags = 0;
+#else
+	int flags = MSG_NOSIGNAL;
+#endif
+
+	if (data) {
+		if (context->pending)
+			return -SEAGAIN;
+
+		if (size > TCP_ICE_BUFFER_SIZE)
+			return -SEMSGSIZE;
+
+		memcpy(context->buffer, data, size);
+		uint16_t wire_size = (uint16_t)size;
+
+		// Pad ChannelData to 4-byte boundary for TCP (RFC 8656 Section 12.5)
+		uint8_t first_byte = (uint8_t)context->buffer[0];
+		if (first_byte >= 64 && first_byte <= 79) {
+			uint16_t padded = (wire_size + 3) & ~3;
+			if (padded > TCP_ICE_BUFFER_SIZE)
+				return -SEMSGSIZE;
+			// Zero-fill padding bytes
+			while (wire_size < padded)
+				context->buffer[wire_size++] = 0;
+		}
+
+		context->length = wire_size;
+		context->bytes_written = 0;
+		context->pending = true;
+	}
+
+	while (context->pending && context->bytes_written < context->length) {
+		int len = send(sock, context->buffer + context->bytes_written,
+		               context->length - context->bytes_written, flags);
+		if (len < 0)
+			return len;
+
+		context->bytes_written += len;
+	}
+
+	context->pending = false;
+	return (int)context->length;
+}
+
+// Read raw STUN or ChannelData message from TCP socket (self-delimiting).
+// STUN: first byte 0x00-0x3F, 20-byte header, payload length at bytes 2-3.
+// ChannelData: first byte 0x40-0x4F, 4-byte header, payload length at bytes 2-3.
+int tcp_stun_read(socket_t sock, tcp_stun_read_context_t *context) {
+#if defined(__APPLE__) || defined(_WIN32)
+	int flags = 0;
+#else
+	int flags = MSG_NOSIGNAL;
+#endif
+
+	if (!context->pending) {
+		context->length = CHANNEL_DATA_HEADER_SIZE; // read min header (4 bytes) to disambiguate
+		context->bytes_read = 0;
+		context->pending = true;
+	}
+
+	while (context->bytes_read < context->length) {
+		uint16_t remaining = context->length - context->bytes_read;
+		if (context->bytes_read < TCP_ICE_BUFFER_SIZE) {
+			uint16_t capacity = TCP_ICE_BUFFER_SIZE - context->bytes_read;
+			if (remaining > capacity)
+				remaining = capacity;
+		} else {
+			// Message too large for buffer, discard overflow
+			char discard[BUFFER_SIZE];
+			if (remaining > (uint16_t)sizeof(discard))
+				remaining = (uint16_t)sizeof(discard);
+			int len = recv(sock, discard, remaining, flags);
+			if (len < 0) {
+				if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
+					JLOG_DEBUG("TCP recv failed, errno=%d", sockerrno);
+				return -sockerrno;
+			}
+			if (len == 0)
+				return 0; // closed
+			context->bytes_read += len;
+			continue;
+		}
+
+		int len = recv(sock, context->buffer + context->bytes_read, remaining, flags);
+		if (len < 0) {
+			if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
+				JLOG_DEBUG("TCP recv failed, errno=%d", sockerrno);
+			return -sockerrno;
+		}
+		if (len == 0)
+			return 0; // closed
+
+		context->bytes_read += len;
+
+		// Once we have the minimum header (4 bytes), determine the full message length
+		if (context->bytes_read >= CHANNEL_DATA_HEADER_SIZE &&
+		    context->length == CHANNEL_DATA_HEADER_SIZE) {
+			uint8_t first_byte = (uint8_t)context->buffer[0];
+			uint16_t payload_len;
+			memcpy(&payload_len, context->buffer + 2, sizeof(uint16_t));
+			payload_len = ntohs(payload_len);
+
+			if (first_byte < 64) {
+				// STUN message: 20-byte header + payload
+				context->length = STUN_HEADER_SIZE + payload_len;
+			} else {
+				// ChannelData: 4-byte header + payload (padded to 4-byte boundary on TCP)
+				uint16_t padded = (payload_len + 3) & ~3;
+				context->length = CHANNEL_DATA_HEADER_SIZE + padded;
+			}
+
+			if (context->length < CHANNEL_DATA_HEADER_SIZE) {
+				JLOG_WARN("TCP message length overflow");
+				context->pending = false;
+				return -1;
+			}
+
+			// If STUN, we still need to read the remaining header bytes
+			// (already reading them as part of the loop)
+		}
+	}
+
+	context->pending = false;
+	uint16_t result_len = context->length;
+	if (result_len > TCP_ICE_BUFFER_SIZE)
+		result_len = TCP_ICE_BUFFER_SIZE;
+	return (int)result_len;
+}
+
+const char *tcp_state_to_string(tcp_state_t state) {
+	switch (state) {
+	case TCP_STATE_DISCONNECTED: return "disconnected";
+	case TCP_STATE_CONNECTING:   return "connecting";
+	case TCP_STATE_CONNECTED:    return "connected";
+	case TCP_STATE_FAILED:       return "failed";
+	default:                     return "unknown";
+	}
 }
 
 JUICE_EXPORT int _juice_tcp_ice_write(socket_t sock, const char *data, size_t size, tcp_ice_write_context_t *context) {

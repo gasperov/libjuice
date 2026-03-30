@@ -19,6 +19,7 @@ int test_mux(void);
 int test_notrickle(void);
 int test_gathering(void);
 int test_turn(void);
+int test_turn_tcp(void);
 int test_conflict(void);
 int test_bind(void);
 int test_ufrag(void);
@@ -71,6 +72,16 @@ int main(int argc, char **argv) {
 	printf("\nRunning TURN connectivity test...\n");
 	if (test_turn()) {
 		fprintf(stderr, "TURN connectivity test failed\n");
+		return -1;
+	}
+*/
+
+// Disabled as it requires an external TURN server
+// Set TURN_HOST, TURN_PORT, TURN_USERNAME, TURN_PASSWORD to enable
+/*
+	printf("\nRunning TURN-TCP connectivity test...\n");
+	if (test_turn_tcp()) {
+		fprintf(stderr, "TURN-TCP connectivity test failed\n");
 		return -1;
 	}
 */

@@ -59,6 +59,7 @@ static int copy_turn_server(juice_turn_server_t *dst, const juice_turn_server_t 
 	dst->username = alloc_string_copy(src->username, &alloc_failed);
 	dst->password = alloc_string_copy(src->password, &alloc_failed);
 	dst->port = src->port;
+	dst->transport = src->transport;
 
 	if (alloc_failed) {
 		JLOG_FATAL("Memory allocation for TURN server configuration copy failed");
@@ -426,9 +427,15 @@ int agent_resolve_servers(juice_agent_t *agent) {
 					snprintf(entry->turn->credentials.username, STUN_MAX_USERNAME_LEN, "%s",
 					         turn_server->username);
 					entry->turn->password = turn_server->password;
+					entry->transport = turn_server->transport;
 					juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
 					entry->transaction_id_expired = false;
 					++agent->entries_count;
+
+					if (turn_server->transport == JUICE_TURN_TRANSPORT_TCP) {
+						JLOG_INFO("Initiating TURN TCP connection to resolved address");
+						conn_turn_tcp_connect(agent, record);
+					}
 
 					agent_arm_transmission(agent, entry, STUN_PACING_TIME * i);
 
@@ -688,6 +695,14 @@ int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char
 	return conn_send(agent, dst, data, size, ds);
 }
 
+int agent_turn_direct_send(juice_agent_t *agent, const agent_stun_entry_t *entry, const char *data,
+                           size_t size, int ds) {
+	if (entry->transport == JUICE_TURN_TRANSPORT_TCP)
+		return conn_turn_tcp_send(agent, data, size, ds);
+
+	return conn_send(agent, &entry->record, data, size, ds);
+}
+
 int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *dst,
                      const char *data, size_t size, int ds) {
 	if (!entry->turn) {
@@ -720,7 +735,7 @@ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr
 		return -1;
 	}
 
-	return agent_direct_send(agent, &entry->record, buffer, size, ds);
+	return agent_turn_direct_send(agent, entry, buffer, size, ds);
 }
 
 int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *record,
@@ -746,7 +761,7 @@ int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const ad
 		return -1;
 	}
 
-	return agent_direct_send(agent, &entry->record, buffer, len, ds);
+	return agent_turn_direct_send(agent, entry, buffer, len, ds);
 }
 
 juice_state_t agent_get_state(juice_agent_t *agent) {
@@ -922,6 +937,16 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 				if(entry->pair->tcp_state != TCP_STATE_CONNECTED)
 					continue;
+			}
+
+			// For TURN TCP entries, wait for TCP connection before sending
+			if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
+			    entry->transport == JUICE_TURN_TRANSPORT_TCP) {
+				if (!conn_turn_tcp_connected(agent)) {
+					JLOG_DEBUG("STUN entry %d: Waiting for TURN TCP connection before sending", i);
+					continue; // Not yet connected; agent_conn_update will re-arm when connected
+				}
+				JLOG_DEBUG("STUN entry %d: TURN TCP connection is ready", i);
 			}
 
 			if (entry->retransmissions >= 0) {
@@ -1997,7 +2022,7 @@ int agent_send_turn_allocate_request(juice_agent_t *agent, const agent_stun_entr
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, 0) < 0) {
+	if (agent_turn_direct_send(agent, entry, buffer, size, 0) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2094,7 +2119,7 @@ int agent_send_turn_create_permission_request(juice_agent_t *agent, agent_stun_e
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
+	if (agent_turn_direct_send(agent, entry, buffer, size, ds) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
@@ -2202,7 +2227,7 @@ int agent_send_turn_channel_bind_request(juice_agent_t *agent, agent_stun_entry_
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
+	if (agent_turn_direct_send(agent, entry, buffer, size, ds) < 0) {
 		JLOG_WARN("STUN message send failed");
 		return -1;
 	}

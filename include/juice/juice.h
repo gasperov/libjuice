@@ -77,11 +77,17 @@ typedef struct juice_mux_binding_request {
 
 typedef void (*juice_cb_mux_incoming_t)(const juice_mux_binding_request_t *info, void *user_ptr);
 
+typedef enum juice_turn_transport {
+	JUICE_TURN_TRANSPORT_UDP = 0, // default, backward-compatible (zero-init)
+	JUICE_TURN_TRANSPORT_TCP = 1,
+} juice_turn_transport_t;
+
 typedef struct juice_turn_server {
 	const char *host;
 	const char *username;
 	const char *password;
 	uint16_t port;
+	juice_turn_transport_t transport;
 } juice_turn_server_t;
 
 typedef enum juice_concurrency_mode {
