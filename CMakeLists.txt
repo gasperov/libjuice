@@ -6,10 +6,12 @@ set(PROJECT_DESCRIPTION "UDP Interactive Connectivity Establishment (ICE) librar
 
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(USE_NETTLE "Use Nettle for hash functions" OFF)
+option(USE_SCHANNEL "Enable TURN over TLS via SChannel (Windows only)" OFF)
 option(NO_SERVER "Disable server support" OFF)
 option(NO_TESTS "Disable tests build" OFF)
 option(WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(FUZZER "Enable oss-fuzz fuzzing" OFF)
+option(BUILD_BENCHMARK "Build the TURN transport throughput benchmark" OFF)
 option(CLANG_TIDY "Enable clang-tidy" OFF)
 
 # Mitigations
@@ -58,6 +60,11 @@ set(LIBJUICE_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/src/turn.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/udp.c
 )
+
+if(WIN32 AND USE_SCHANNEL)
+	list(APPEND LIBJUICE_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/tls_schannel.c)
+endif()
+
 source_group("Source Files" FILES "${LIBJUICE_SOURCES}")
 
 set(LIBJUICE_HEADERS
@@ -140,6 +147,13 @@ endif()
 if (NO_SERVER)
 	target_compile_definitions(juice PRIVATE NO_SERVER)
 	target_compile_definitions(juice-static PRIVATE NO_SERVER)
+endif()
+
+if(WIN32 AND USE_SCHANNEL)
+	target_compile_definitions(juice PRIVATE USE_SCHANNEL=1)
+	target_compile_definitions(juice-static PRIVATE USE_SCHANNEL=1)
+	target_link_libraries(juice PRIVATE secur32 crypt32)
+	target_link_libraries(juice-static PRIVATE secur32 crypt32)
 endif()
 
 if(APPLE)
@@ -247,6 +261,16 @@ if(NOT NO_TESTS)
 
 	if(WIN32)
 		target_link_libraries(juice-tests ws2_32)
+	endif()
+endif()
+
+# Benchmark
+if(BUILD_BENCHMARK)
+	add_executable(turn-bench ${CMAKE_CURRENT_SOURCE_DIR}/benchmark/turn_bench.c)
+	target_include_directories(turn-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/juice)
+	target_link_libraries(turn-bench juice)
+	if(WIN32)
+		target_link_libraries(turn-bench ws2_32)
 	endif()
 endif()
 
