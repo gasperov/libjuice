@@ -30,6 +30,11 @@ socket_t tcp_create_socket(const addr_record_t *dst) {
 		JLOG_WARN("Setting TCP_NODELAY on TCP socket failed, errno=%d", sockerrno);
 	}
 
+	// Set buffer size up to 1 MiB for performance, matching udp.c
+	const sockopt_t buffer_size = 1 * 1024 * 1024;
+	setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size, sizeof(buffer_size));
+	setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size, sizeof(buffer_size));
+
 	ctl_t nbio = 1;
 	if (ioctlsocket(sock, FIONBIO, &nbio)) {
 		JLOG_ERROR("Setting non-blocking mode on TCP socket failed, errno=%d", sockerrno);
@@ -154,7 +159,8 @@ int tcp_ice_read(socket_t sock, tcp_read_context_t *context) {
 
 // Write raw STUN or ChannelData message to TCP socket (no RFC 4571 framing).
 // ChannelData is padded to 4-byte boundary per RFC 8656 Section 12.5.
-int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context) {
+int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context,
+                   tls_client_t *tls) {
 #if defined(__APPLE__) || defined(_WIN32)
 	int flags = 0;
 #else
@@ -182,13 +188,22 @@ int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_conte
 		}
 
 		context->length = wire_size;
+		context->send_length = wire_size;
+
+		if (tls) {
+			int enc = tls_encode(tls, context->buffer, sizeof(context->buffer), wire_size);
+			if (enc < 0)
+				return enc;
+			context->send_length = (uint16_t)enc; // ciphertext now occupies buffer[0..enc)
+		}
+
 		context->bytes_written = 0;
 		context->pending = true;
 	}
 
-	while (context->pending && context->bytes_written < context->length) {
+	while (context->pending && context->bytes_written < context->send_length) {
 		int len = send(sock, context->buffer + context->bytes_written,
-		               context->length - context->bytes_written, flags);
+		               context->send_length - context->bytes_written, flags);
 		if (len < 0) {
 			if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 				JLOG_DEBUG("TCP send failed, errno=%d", sockerrno);
@@ -202,12 +217,71 @@ int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_conte
 	return (int)context->length;
 }
 
+// recv()-compatible contract (>0 bytes copied, 0 on orderly close, negative incl. -SEAGAIN),
+// backed by TLS instead of the raw socket. A single STUN/ChannelData message can need bytes from
+// more than one TLS record, and a single decoded record can hold more plaintext than the current
+// message still needs, so the cipher state's buf holds, in order: [0..plain_len) plaintext
+// already decoded but not yet delivered, then [plain_len..len) raw ciphertext not yet decoded.
+static int tcp_stun_tls_recv(tls_client_t *tls, socket_t sock, char *dst, uint32_t cap) {
+	tls_cipher_state_t *cs = tls_client_cipher_state(tls);
+
+	for (;;) {
+		if (cs->plain_len > 0) {
+			uint32_t n = cs->plain_len < cap ? cs->plain_len : cap;
+			memcpy(dst, cs->buf, n);
+			uint32_t remainder = cs->len - n;
+			if (remainder > 0)
+				memmove(cs->buf, cs->buf + n, remainder);
+			cs->plain_len -= n;
+			cs->len -= n;
+			return (int)n;
+		}
+
+		if (cs->len > 0) {
+			char *pt;
+			size_t pt_len, consumed;
+			int ret = tls_decode(tls, cs->buf, cs->len, &pt, &pt_len, &consumed);
+			if (ret < 0)
+				return -SECONNRESET;
+			if (ret == 1) {
+				size_t extra = cs->len - consumed;
+				// pt aliases cs->buf, after the record's header: close that gap, then close the
+				// gap left by the consumed header+trailer for any leftover ciphertext too.
+				if (pt_len > 0)
+					memmove(cs->buf, pt, pt_len);
+				if (extra > 0)
+					memmove(cs->buf + pt_len, cs->buf + consumed, extra);
+				if (pt_len == 0 && extra == 0)
+					return 0; // peer's close_notify: reported as a valid, empty record
+				cs->plain_len = (uint32_t)pt_len;
+				cs->len = (uint32_t)(pt_len + extra);
+				continue; // deliver from the newly decoded plaintext above
+			}
+			// ret == 0: not a complete record yet, read more below
+		}
+
+		if (cs->len >= sizeof(cs->buf)) {
+			JLOG_WARN("TLS record exceeds internal buffer");
+			return -SECONNRESET;
+		}
+		int n = recv(sock, cs->buf + cs->len, (int)(sizeof(cs->buf) - cs->len), 0);
+		if (n < 0) {
+			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
+				return -SEAGAIN;
+			return -sockerrno;
+		}
+		if (n == 0)
+			return 0; // closed
+		cs->len += (uint32_t)n;
+	}
+}
+
 // Read raw STUN or ChannelData message from TCP socket (self-delimiting).
 // ChannelData is identified by is_channel_data() (same check as the UDP path, turn.c). A STUN
 // message can only be confirmed once its full 20-byte header has arrived, since that requires
 // validating the magic cookie via is_stun_datagram() (stun.c) rather than just the top-2-bits
 // heuristic used below to size the frame while it is still being read.
-int tcp_stun_read(socket_t sock, tcp_read_context_t *context) {
+int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls) {
 #if defined(__APPLE__) || defined(_WIN32)
 	int flags = 0;
 #else
@@ -237,8 +311,11 @@ int tcp_stun_read(socket_t sock, tcp_read_context_t *context) {
 			dst = buffer;
 		}
 
-		int len = recv(sock, dst, remaining, flags);
+		int len = tls ? tcp_stun_tls_recv(tls, sock, dst, remaining)
+		             : recv(sock, dst, remaining, flags);
 		if (len < 0) {
+			if (tls)
+				return len; // already a signed error code, not a raw sockerrno to translate
 			if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 				JLOG_DEBUG("TCP recv failed, errno=%d", sockerrno);
 			return -sockerrno;
@@ -286,28 +363,40 @@ int tcp_stun_read(socket_t sock, tcp_read_context_t *context) {
 
 const char *tcp_state_to_string(tcp_state_t state) {
 	switch (state) {
-	case TCP_STATE_DISCONNECTED: return "disconnected";
-	case TCP_STATE_CONNECTING:   return "connecting";
-	case TCP_STATE_CONNECTED:    return "connected";
-	case TCP_STATE_FAILED:       return "failed";
-	default:                     return "unknown";
+	case TCP_STATE_DISCONNECTED:     return "disconnected";
+	case TCP_STATE_CONNECTING:       return "connecting";
+	case TCP_STATE_TLS_HANDSHAKING:  return "tls_handshaking";
+	case TCP_STATE_CONNECTED:        return "connected";
+	case TCP_STATE_FAILED:           return "failed";
+	default:                         return "unknown";
 	}
 }
 
 const char *tcp_framing_to_string(tcp_framing_t framing) {
-	return framing == TCP_FRAMING_STUN ? "TURN-TCP" : "ICE-TCP";
+	switch (framing) {
+	case TCP_FRAMING_ICE:      return "ICE-TCP";
+	case TCP_FRAMING_STUN:     return "TURN-TCP";
+	case TCP_FRAMING_STUN_TLS: return "TURNS";
+	default:                   return "unknown";
+	}
 }
 
+// Assumes no meaningful prior state (fresh calloc, or a slot already cleared by
+// tcp_conn_reset()): does not free an existing tc->tls, so this is safe to call on an
+// uninitialized tcp_conn_t (as the test helpers do), unlike tcp_conn_reset() below.
 void tcp_conn_init(tcp_conn_t *tc, tcp_framing_t framing) {
 	tc->sock = INVALID_SOCKET;
 	tc->state = TCP_STATE_DISCONNECTED;
 	tc->framing = framing;
+	tc->tls = NULL;
 	memset(&tc->dst, 0, sizeof(tc->dst));
 	memset(&tc->write, 0, sizeof(tc->write));
 	memset(&tc->read,  0, sizeof(tc->read));
 }
 
 void tcp_conn_reset(tcp_conn_t *tc) {
+	tls_client_destroy(tc->tls);
+	tc->tls = NULL;
 	memset(&tc->write, 0, sizeof(tc->write));
 	memset(&tc->read,  0, sizeof(tc->read));
 }
@@ -321,11 +410,11 @@ JUICE_EXPORT int _juice_tcp_ice_read(socket_t sock, tcp_read_context_t *context)
 }
 
 JUICE_EXPORT int _juice_tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context) {
-	return tcp_stun_write(sock, data, size, context);
+	return tcp_stun_write(sock, data, size, context, NULL);
 }
 
 JUICE_EXPORT int _juice_tcp_stun_read(socket_t sock, tcp_read_context_t *context) {
-	return tcp_stun_read(sock, context);
+	return tcp_stun_read(sock, context, NULL);
 }
 
 JUICE_EXPORT void _juice_tcp_conn_init(tcp_conn_t *tc, tcp_framing_t framing) {

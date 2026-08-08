@@ -12,10 +12,12 @@
 #include "addr.h"
 #include "juice.h"
 #include "socket.h"
+#include "tls_schannel.h"
 
 typedef enum tcp_state {
 	TCP_STATE_DISCONNECTED,
 	TCP_STATE_CONNECTING,
+	TCP_STATE_TLS_HANDSHAKING,
 	TCP_STATE_CONNECTED,
 	TCP_STATE_FAILED
 } tcp_state_t;
@@ -23,6 +25,14 @@ typedef enum tcp_state {
 socket_t tcp_create_socket(const addr_record_t *dst);
 
 #define TCP_BUFFER_SIZE 2048
+
+// Extra room reserved in the buffers below for a TLS record header+trailer when framing runs
+// over TLS (TURNS), so a max-size plaintext message's ciphertext still fits in place. Real
+// overhead (queried from cbHeader/cbTrailer after the handshake) is a fraction of this for the
+// AEAD cipher suites Windows negotiates by default (e.g. AES-GCM: ~29 bytes); this is just a
+// safe fixed upper bound so the struct layout doesn't depend on what gets negotiated at runtime.
+#define TLS_RECORD_OVERHEAD_RESERVE 128
+#define TCP_CONTEXT_BUFFER_SIZE (TCP_BUFFER_SIZE + TLS_RECORD_OVERHEAD_RESERVE)
 
 // STUN messages: 20-byte header, length at bytes 2-3 (payload only, total = 20 + length)
 // ChannelData:    4-byte header, length at bytes 2-3 (payload only, total = 4 + length)
@@ -32,8 +42,9 @@ socket_t tcp_create_socket(const addr_record_t *dst);
 #define CHANNEL_DATA_HEADER_SIZE 4
 
 typedef struct tcp_write_context {
-	char buffer[TCP_BUFFER_SIZE];
-	uint16_t length;
+	char buffer[TCP_CONTEXT_BUFFER_SIZE];
+	uint16_t length;      // plaintext size, returned to the caller on completion
+	uint16_t send_length; // bytes actually on the wire: == length, or the TLS ciphertext size
 	uint16_t bytes_written;
 	bool pending;
 } tcp_write_context_t;
@@ -54,13 +65,16 @@ typedef struct tcp_read_context {
 int tcp_ice_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context);
 int tcp_ice_read(socket_t sock, tcp_read_context_t *context);
 
-// Self-delimiting STUN/ChannelData framing used for TURN-TCP
-int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context);
-int tcp_stun_read(socket_t sock, tcp_read_context_t *context);
+// Self-delimiting STUN/ChannelData framing used for TURN-TCP. tls is NULL for plain TURN-TCP;
+// when set, I/O goes through it instead of the raw socket (TURNS).
+int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context,
+                   tls_client_t *tls);
+int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls);
 
 typedef enum tcp_framing {
-	TCP_FRAMING_ICE,  // 2-byte length prefix (ICE-TCP)
-	TCP_FRAMING_STUN, // self-delimiting STUN/ChannelData (TURN-TCP)
+	TCP_FRAMING_ICE,      // 2-byte length prefix (ICE-TCP)
+	TCP_FRAMING_STUN,     // self-delimiting STUN/ChannelData (TURN-TCP)
+	TCP_FRAMING_STUN_TLS, // self-delimiting STUN/ChannelData over TLS (TURNS)
 } tcp_framing_t;
 
 typedef struct tcp_conn {
@@ -70,6 +84,7 @@ typedef struct tcp_conn {
 	tcp_read_context_t read;
 	addr_record_t dst;
 	tcp_state_t state;
+	tls_client_t *tls; // NULL unless framing == TCP_FRAMING_STUN_TLS
 } tcp_conn_t;
 
 const char *tcp_state_to_string(tcp_state_t state);

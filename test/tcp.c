@@ -813,6 +813,82 @@ int test_tcp_ice_write_eagain(void) {
 	return 0;
 }
 
+#if defined(_WIN32) && defined(USE_SCHANNEL)
+// tls_client_handshake() used to treat any send() failure while flushing a handshake token as
+// fatal, including EWOULDBLOCK on the non-blocking socket every TURNS connection actually uses.
+// This verifies the extracted send-with-resume helper correctly reports EWOULDBLOCK as "not
+// done yet" (0, with progress already recorded in *off) rather than as an error, and that a
+// later call resumes and completes from that same offset.
+int test_tls_send_partial(void) {
+	socket_t wr, rd;
+	if (make_tcp_loopback_pair(&wr, &rd) != 0) {
+		printf("Failure: socket pair\n");
+		return -1;
+	}
+
+	// make_tcp_loopback_pair leaves the writer blocking; make it non-blocking so send() can
+	// return EWOULDBLOCK instead of blocking this thread.
+	ctl_t nbio = 1;
+	ioctlsocket(wr, FIONBIO, &nbio);
+
+	// Shrink both ends' buffers so a modest payload is enough to force EWOULDBLOCK.
+	int small_buf = 4096;
+	setsockopt(wr, SOL_SOCKET, SO_SNDBUF, (const char *)&small_buf, sizeof(small_buf));
+	setsockopt(rd, SOL_SOCKET, SO_RCVBUF, (const char *)&small_buf, sizeof(small_buf));
+
+	size_t big_size = 1024 * 1024; // comfortably exceeds the shrunk buffers
+	char *big = (char *)malloc(big_size);
+	if (!big) {
+		printf("Failure: alloc\n");
+		closesocket(wr); closesocket(rd);
+		return -1;
+	}
+	for (size_t i = 0; i < big_size; ++i)
+		big[i] = (char)(i & 0xFF);
+
+	size_t off = 0;
+	int ret = _juice_tls_send_partial(wr, big, big_size, &off);
+	if (ret != 0 || off == 0 || off >= big_size) {
+		printf("Failure: expected a partial send (0 < off < %zu) with ret=0 (EWOULDBLOCK), "
+		       "got ret=%d off=%zu\n", big_size, ret, off);
+		free(big); closesocket(wr); closesocket(rd);
+		return -1;
+	}
+	printf("First send_partial: %zu/%zu bytes before EWOULDBLOCK\n", off, big_size);
+
+	// Drain the receiver and resume from the same off, exactly as tls_client_handshake() does
+	// on the next poll() readiness event, until fully sent (bounded for safety).
+	char drain[8192];
+	int rounds = 0;
+	while (ret == 0 && rounds++ < 1000) {
+		while (recv(rd, drain, sizeof(drain), 0) > 0) {
+			// discard
+		}
+		ret = _juice_tls_send_partial(wr, big, big_size, &off);
+		if (ret == 0)
+			Sleep(1);
+	}
+
+	free(big);
+
+	if (ret != 1 || off != big_size) {
+		printf("Failure: send_partial did not complete, ret=%d off=%zu/%zu\n", ret, off, big_size);
+		closesocket(wr); closesocket(rd);
+		return -1;
+	}
+
+	closesocket(wr);
+	closesocket(rd);
+	printf("Success\n");
+	return 0;
+}
+#else
+int test_tls_send_partial(void) {
+	printf("SChannel not built (USE_SCHANNEL); skipping\n");
+	return 0;
+}
+#endif
+
 static juice_agent_t *agent1;
 static juice_agent_t *agent2;
 

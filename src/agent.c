@@ -78,6 +78,14 @@ static bool entry_is_tcp(const agent_stun_entry_t *entry) {
 	return entry->record.socktype == SOCK_STREAM;
 }
 
+// Relay transport preference tier, lowest is best: UDP < TURN-TCP < TURNS (TLS). Mirrors
+// RELAYED_TCP_PRIORITY_PENALTY/RELAYED_TLS_PRIORITY_PENALTY.
+static int relay_entry_rank(const agent_stun_entry_t *entry) {
+	if (!entry_is_tcp(entry))
+		return 0;
+	return entry->tls ? 2 : 1;
+}
+
 juice_agent_t *agent_create(const juice_config_t *config) {
 	JLOG_VERBOSE("Creating agent");
 
@@ -133,6 +141,9 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 
 	agent->turn_servers_tcp = NULL;
 	agent->turn_servers_tcp_count = 0;
+	agent->turn_servers_tls = NULL;
+	agent->turn_servers_tls_count = 0;
+	agent->turn_servers_tls_insecure = NULL;
 
 	agent->state = JUICE_STATE_DISCONNECTED;
 	agent->mode = AGENT_MODE_UNKNOWN;
@@ -197,6 +208,14 @@ void agent_destroy(juice_agent_t *agent) {
 		free((void *)turn_server->password);
 	}
 	free(agent->turn_servers_tcp);
+	for (int i = 0; i < agent->turn_servers_tls_count; ++i) {
+		juice_turn_server_t *turn_server = agent->turn_servers_tls + i;
+		free((void *)turn_server->host);
+		free((void *)turn_server->username);
+		free((void *)turn_server->password);
+	}
+	free(agent->turn_servers_tls);
+	free(agent->turn_servers_tls_insecure);
 	free((void *)agent->config.bind_address);
 	free(agent);
 
@@ -220,6 +239,12 @@ static bool has_nonnumeric_server_hostnames(const juice_agent_t *agent) {
 
 	for (int i = 0; i < agent->turn_servers_tcp_count; ++i) {
 		const juice_turn_server_t *s = agent->turn_servers_tcp + i;
+		if (s->host && !addr_is_numeric_hostname(s->host, SOCK_STREAM))
+			return true;
+	}
+
+	for (int i = 0; i < agent->turn_servers_tls_count; ++i) {
+		const juice_turn_server_t *s = agent->turn_servers_tls + i;
 		if (s->host && !addr_is_numeric_hostname(s->host, SOCK_STREAM))
 			return true;
 	}
@@ -360,13 +385,15 @@ int agent_gather_candidates(juice_agent_t *agent) {
 }
 
 static void agent_resolve_turn_servers(juice_agent_t *agent, juice_turn_server_t *servers, int servers_count,
-										int socktype, int *count, int max_count, timediff_t tcp_connect_delay) {
+										int socktype, int *count, int max_count, timediff_t tcp_connect_delay,
+										bool tls, const bool *tls_insecure) {
 
+	const char *proto = socktype == SOCK_DGRAM ? "UDP" : (tls ? "TLS" : "TCP");
 	bool has_entries = *count;
 	for (int i = 0; i < servers_count; ++i) {
 		if (*count >= max_count) {
 			JLOG_WARN("Relay entry limit (%d) reached, ignoring remaining %s TURN server(s)",
-			          max_count, socktype == SOCK_DGRAM ? "UDP" : "TCP");
+			          max_count, proto);
 			break;
 		}
 
@@ -394,7 +421,7 @@ static void agent_resolve_turn_servers(juice_agent_t *agent, juice_turn_server_t
 			if (records_count > DEFAULT_MAX_RECORDS_COUNT)
 				records_count = DEFAULT_MAX_RECORDS_COUNT;
 
-			JLOG_INFO("Using TURN server %s:%s over %s", hostname, service, (socktype == SOCK_DGRAM ? "UDP" : "TCP"));
+			JLOG_INFO("Using TURN server %s:%s over %s", hostname, service, proto);
 
 			addr_record_t *record = NULL;
 			for (int j = 0; j < records_count; ++j) {
@@ -429,6 +456,9 @@ static void agent_resolve_turn_servers(juice_agent_t *agent, juice_turn_server_t
 				entry->pair = NULL;
 				entry->record = *record;
 				entry->turn_redirections = 0;
+				entry->tls = tls;
+				entry->tls_hostname = tls ? turn_server->host : NULL;
+				entry->tls_insecure = tls && tls_insecure ? tls_insecure[i] : false;
 				entry->turn = calloc(1, sizeof(agent_turn_state_t));
 				if (!entry->turn) {
 					JLOG_ERROR("Memory allocation for TURN state failed");
@@ -471,20 +501,28 @@ int agent_resolve_servers(juice_agent_t *agent) {
 	} else {
 		int count = 0;
 
-		// Relay entries are capped at MAX_RELAY_ENTRIES_COUNT total (shared by UDP and TCP
-		// servers, since that bound also sizes MAX_CANDIDATE_PAIRS_COUNT). Reserve one slot for
-		// TCP whenever TCP TURN servers are configured, so it doesn't get starved out entirely
-		// by a full complement of UDP servers.
+		// Relay entries are capped at MAX_RELAY_ENTRIES_COUNT total (shared across UDP, TCP and
+		// TLS servers, since that bound also sizes MAX_CANDIDATE_PAIRS_COUNT). Reserve one slot
+		// for TCP/TLS whenever either is configured, so it doesn't get starved out entirely by a
+		// full complement of UDP servers; if both TCP and TLS servers are configured alongside
+		// UDP, only one of them (TCP, resolved first below) is guaranteed that reserved slot.
+		bool has_tcp_or_tls = agent->turn_servers_tcp_count > 0 || agent->turn_servers_tls_count > 0;
 		int udp_max = MAX_RELAY_ENTRIES_COUNT;
-		if (agent->turn_servers_tcp_count > 0 && udp_max > 0)
+		if (has_tcp_or_tls && udp_max > 0)
 			--udp_max;
 
+		timediff_t fallback_delay = agent->config.turn_servers_count > 0 ? TURN_TCP_DELAY_START : 0;
+
 		agent_resolve_turn_servers(agent, agent->config.turn_servers,
-		                           agent->config.turn_servers_count, SOCK_DGRAM, &count, udp_max, 0);
+		                           agent->config.turn_servers_count, SOCK_DGRAM, &count, udp_max, 0,
+		                           false, NULL);
 		agent_resolve_turn_servers(agent, agent->turn_servers_tcp,
 		                           agent->turn_servers_tcp_count, SOCK_STREAM, &count,
-		                           MAX_RELAY_ENTRIES_COUNT,
-		                           agent->config.turn_servers_count > 0 ? TURN_TCP_DELAY_START : 0);
+		                           MAX_RELAY_ENTRIES_COUNT, fallback_delay, false, NULL);
+		agent_resolve_turn_servers(agent, agent->turn_servers_tls,
+		                           agent->turn_servers_tls_count, SOCK_STREAM, &count,
+		                           MAX_RELAY_ENTRIES_COUNT, fallback_delay, true,
+		                           agent->turn_servers_tls_insecure);
 	}
 
 	// STUN server resolution
@@ -715,6 +753,48 @@ int agent_add_turn_server_tcp(juice_agent_t *agent, const juice_turn_server_t *t
 	}
 	return agent_add_turn_server_to_list(&agent->turn_servers_tcp,
 	                               &agent->turn_servers_tcp_count, turn_server);
+}
+
+int agent_add_turn_server_tls(juice_agent_t *agent, const juice_turn_server_t *turn_server,
+                              bool insecure_skip_verify) {
+	if (agent->conn_impl) {
+		JLOG_WARN("Unable to add TURN server, candidates gathering already started");
+		return -1;
+	}
+	if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL) {
+		JLOG_WARN("TURN over TLS is only supported in poll concurrency mode");
+		return -1;
+	}
+#if !defined(_WIN32) || !defined(USE_SCHANNEL)
+	(void)insecure_skip_verify;
+	JLOG_WARN("TURN over TLS requires SChannel support (built with USE_SCHANNEL on Windows)");
+	return -1;
+#else
+	// Grow both arrays before touching either's count, so a failure partway through can't leave
+	// turn_servers_tls_insecure shorter than turn_servers_tls_count.
+	int new_count = agent->turn_servers_tls_count + 1;
+	juice_turn_server_t *new_servers =
+	    realloc(agent->turn_servers_tls, (size_t)new_count * sizeof(juice_turn_server_t));
+	if (!new_servers) {
+		JLOG_FATAL("Memory allocation for TURN servers failed");
+		return -1;
+	}
+	agent->turn_servers_tls = new_servers;
+
+	bool *new_insecure = realloc(agent->turn_servers_tls_insecure, (size_t)new_count * sizeof(bool));
+	if (!new_insecure) {
+		JLOG_FATAL("Memory allocation for TURN server flags failed");
+		return -1;
+	}
+	agent->turn_servers_tls_insecure = new_insecure;
+
+	memset(new_servers + agent->turn_servers_tls_count, 0, sizeof(juice_turn_server_t));
+	if (copy_turn_server(new_servers + agent->turn_servers_tls_count, turn_server) < 0)
+		return -1;
+	new_insecure[agent->turn_servers_tls_count] = insecure_skip_verify;
+	agent->turn_servers_tls_count = new_count;
+	return 0;
+#endif
 }
 
 int agent_set_remote_gathering_done(juice_agent_t *agent) {
@@ -986,8 +1066,12 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			if (entry_is_tcp(entry)) {
 			    if (entry->tcp_state == TCP_STATE_DISCONNECTED) {
 					// First attempt a TCP connection
-					conn_tcp_connect(agent, &entry->record,
-						entry->type == AGENT_STUN_ENTRY_TYPE_RELAY ? TCP_FRAMING_STUN : TCP_FRAMING_ICE);
+					tcp_framing_t framing = TCP_FRAMING_ICE;
+					if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY)
+						framing = entry->tls ? TCP_FRAMING_STUN_TLS : TCP_FRAMING_STUN;
+					conn_tcp_connect(agent, &entry->record, framing,
+					                entry->tls ? entry->tls_hostname : NULL,
+					                entry->tls && entry->tls_insecure);
 				}
 
 				if(entry->tcp_state != TCP_STATE_CONNECTED)
@@ -1928,15 +2012,18 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			JLOG_INFO("Allocated TURN relayed address %s", relayed_str);
 		}
 
-		if (!entry_is_tcp(entry)) {
-			// A relay obtained over UDP is preferred: cancel TURN TCP entries that have not
-			// started connecting yet
+		{
+			// A relay of a given transport tier succeeding means any pending relay entry in a
+			// strictly worse tier (UDP < TURN-TCP < TURNS) that has not started connecting yet
+			// can be cancelled; entries in an equal or better tier are left to keep trying.
+			int rank = relay_entry_rank(entry);
 			for (int i = 0; i < agent->entries_count; ++i) {
 				agent_stun_entry_t *other_entry = agent->entries + i;
-				if (other_entry->type == AGENT_STUN_ENTRY_TYPE_RELAY && entry_is_tcp(other_entry) &&
+				if (other_entry->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
+				    relay_entry_rank(other_entry) > rank &&
 				    other_entry->state == AGENT_STUN_ENTRY_STATE_PENDING &&
 				    other_entry->tcp_state == TCP_STATE_DISCONNECTED) {
-					JLOG_DEBUG("STUN entry %d: Cancelled TURN TCP entry as a relay was obtained over UDP", i);
+					JLOG_DEBUG("STUN entry %d: Cancelled worse-tier TURN entry after a better relay succeeded", i);
 					other_entry->state = AGENT_STUN_ENTRY_STATE_CANCELLED;
 					other_entry->next_transmission = 0;
 				}
@@ -2357,8 +2444,11 @@ int agent_add_local_relayed_candidate(juice_agent_t *agent, const agent_stun_ent
 		JLOG_ERROR("Failed to create relayed candidate");
 		return -1;
 	}
+
 	if (entry_is_tcp(entry) && candidate.priority >= RELAYED_TCP_PRIORITY_PENALTY)
 		candidate.priority -= RELAYED_TCP_PRIORITY_PENALTY;
+	if (entry->tls && candidate.priority >= RELAYED_TLS_PRIORITY_PENALTY)
+		candidate.priority -= RELAYED_TLS_PRIORITY_PENALTY;
 
 	if (ice_add_candidate(&candidate, &agent->local)) {
 		JLOG_ERROR("Failed to add candidate to local description");
@@ -2886,5 +2976,7 @@ int agent_get_selected_relay_transport(juice_agent_t *agent) {
 	if (!entry || !entry->relay_entry)
 		return -1; // not connected, or selected pair is not relayed
 
-	return entry_is_tcp(entry->relay_entry) ? JUICE_TURN_TRANSPORT_TCP : JUICE_TURN_TRANSPORT_UDP;
+	if (!entry_is_tcp(entry->relay_entry))
+		return JUICE_TURN_TRANSPORT_UDP;
+	return entry->relay_entry->tls ? JUICE_TURN_TRANSPORT_TLS : JUICE_TURN_TRANSPORT_TCP;
 }

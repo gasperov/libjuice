@@ -254,13 +254,14 @@ int conn_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, 
 	return get_agent_mode_entry(agent)->send_func(agent, dst, data, size, ds);
 }
 
-void conn_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing) {
+void conn_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing,
+                      const char *tls_hostname, bool tls_insecure_skip_verify) {
 	if (!agent->conn_impl)
 		return;
 
 	conn_mode_entry_t *entry = get_agent_mode_entry(agent);
 	if (entry->tcp_connect_func)
-		entry->tcp_connect_func(agent, dst, framing);
+		entry->tcp_connect_func(agent, dst, framing, tls_hostname, tls_insecure_skip_verify);
 	else
 		JLOG_WARN("TCP connect not supported in this concurrency mode");
 }

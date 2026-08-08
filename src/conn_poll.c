@@ -225,6 +225,9 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 			tcp_pfd->fd = tc->sock;
 			if (tc->state == TCP_STATE_CONNECTING) {
 				tcp_pfd->events = POLLOUT;
+			} else if (tc->state == TCP_STATE_TLS_HANDSHAKING) {
+				// SChannel decides whether it needs to read or write next; watch both.
+				tcp_pfd->events = POLLIN | POLLOUT;
 			} else {
 				tcp_pfd->events = POLLIN;
 				if (tc->write.pending) {
@@ -326,7 +329,7 @@ int conn_poll_recv_udp(socket_t sock, char *buffer, size_t size, addr_record_t *
 void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t *tc) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 	const char *label = tcp_framing_to_string(tc->framing);
-	bool stun_framing = tc->framing == TCP_FRAMING_STUN;
+	bool self_delimited = tc->framing == TCP_FRAMING_STUN || tc->framing == TCP_FRAMING_STUN_TLS;
 
 	if (pfd->revents & POLLNVAL) {
 		JLOG_WARN("Invalid %s socket", label);
@@ -339,37 +342,54 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 		return;
 	}
 
-	if (pfd->revents & POLLOUT) {
-		if (tc->state == TCP_STATE_CONNECTING) {
-			int err = 0;
-			socklen_t errlen = sizeof(err);
-			if (getsockopt(tc->sock, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen) != 0) {
-				JLOG_INFO("Failed to get %s socket error code, errno=%d", label, sockerrno);
-				conn_poll_change_tcp_fail(agent, tc);
-				return;
-			}
+	if (tc->state == TCP_STATE_CONNECTING && (pfd->revents & POLLOUT)) {
+		int err = 0;
+		socklen_t errlen = sizeof(err);
+		if (getsockopt(tc->sock, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen) != 0) {
+			JLOG_INFO("Failed to get %s socket error code, errno=%d", label, sockerrno);
+			conn_poll_change_tcp_fail(agent, tc);
+			return;
+		}
 
-			if (err != 0) {
-				JLOG_INFO("%s connection failed on SO_ERROR, errno=%d", label, err);
-				conn_poll_change_tcp_fail(agent, tc);
-				return;
-			}
+		if (err != 0) {
+			JLOG_INFO("%s connection failed on SO_ERROR, errno=%d", label, err);
+			conn_poll_change_tcp_fail(agent, tc);
+			return;
+		}
 
-
+		if (tc->framing == TCP_FRAMING_STUN_TLS) {
+			JLOG_INFO("%s TCP connected, starting TLS handshake", label);
+			conn_poll_change_tcp_state(agent, tc, TCP_STATE_TLS_HANDSHAKING);
+		} else {
 			JLOG_INFO("%s connection established (POLLOUT with no error)", label);
 			conn_poll_change_tcp_state(agent, tc, TCP_STATE_CONNECTED);
-		} else {
-			if (tc->write.pending) {
-				int ret = stun_framing
-				    ? tcp_stun_write(tc->sock, NULL, 0, &tc->write)
-				    : tcp_ice_write(tc->sock, NULL, 0, &tc->write);
-				if (ret >= 0) {
-					JLOG_DEBUG("Finished sending %s message", label);
-				} else if (ret == -SEAGAIN || ret == -SEWOULDBLOCK) {
-					JLOG_WARN("%s send failed, errno=%d", label, -ret);
-					conn_poll_change_tcp_fail(agent, tc);
-					return;
-				}
+		}
+		return; // pollfd events are recomputed for the new state on the next conn_poll_prepare
+	}
+
+	if (tc->state == TCP_STATE_TLS_HANDSHAKING) {
+		int ret = tls_client_handshake(tc->tls, tc->sock);
+		if (ret < 0) {
+			JLOG_INFO("%s handshake failed", label);
+			conn_poll_change_tcp_fail(agent, tc);
+		} else if (ret == 1) {
+			JLOG_INFO("%s handshake complete", label);
+			conn_poll_change_tcp_state(agent, tc, TCP_STATE_CONNECTED);
+		}
+		return;
+	}
+
+	if (pfd->revents & POLLOUT) {
+		if (tc->write.pending) {
+			int ret = self_delimited
+			    ? tcp_stun_write(tc->sock, NULL, 0, &tc->write, tc->tls)
+			    : tcp_ice_write(tc->sock, NULL, 0, &tc->write);
+			if (ret >= 0) {
+				JLOG_DEBUG("Finished sending %s message", label);
+			} else if (ret == -SEAGAIN || ret == -SEWOULDBLOCK) {
+				JLOG_WARN("%s send failed, errno=%d", label, -ret);
+				conn_poll_change_tcp_fail(agent, tc);
+				return;
 			}
 		}
 	}
@@ -378,8 +398,8 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 		int ret = 0;
 		int left = 1000; // limit for fairness between sockets
 		while (left--) {
-			ret = stun_framing
-				? tcp_stun_read(tc->sock, &tc->read)
+			ret = self_delimited
+				? tcp_stun_read(tc->sock, &tc->read, tc->tls)
 				: tcp_ice_read(tc->sock, &tc->read);
 			if (ret <= 0) {
 				break;
@@ -576,6 +596,7 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 		if (tc) {
 			if (tc->sock != INVALID_SOCKET)
 				closesocket(tc->sock);
+			tls_client_destroy(tc->tls);
 			free(tc);
 			conn_impl->tcp[k] = NULL;
 		}
@@ -640,10 +661,11 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 			return -SEAGAIN;
 		}
 
+		bool self_delimited = tc->framing == TCP_FRAMING_STUN || tc->framing == TCP_FRAMING_STUN_TLS;
 		tcp_write_context_t *context = &tc->write;
 		if (!context->pending) {
-			ret = (tc->framing == TCP_FRAMING_STUN)
-			          ? tcp_stun_write(tc->sock, data, size, context)
+			ret = self_delimited
+			          ? tcp_stun_write(tc->sock, data, size, context, tc->tls)
 			          : tcp_ice_write(tc->sock, data, size, context);
 			if (context->pending && (ret == -SEAGAIN || ret == -SEWOULDBLOCK))
 				ret = (int)size; // datagram is buffered, consider it sent
@@ -678,7 +700,8 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 	return ret;
 }
 
-void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing) {
+void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing,
+                           const char *tls_hostname, bool tls_insecure_skip_verify) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	mutex_lock(&conn_impl->registry->mutex);
@@ -714,6 +737,23 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_f
 		}
 	}
 
+	if (framing == TCP_FRAMING_STUN_TLS) {
+#if defined(_WIN32) && defined(USE_SCHANNEL)
+		tc->tls = tls_client_create(tls_hostname, tls_insecure_skip_verify);
+		if (!tc->tls) {
+			JLOG_WARN("TLS client creation failed for %s", tls_hostname ? tls_hostname : "?");
+			free(tc);
+			conn_impl->tcp[k] = NULL;
+			goto done;
+		}
+#else
+		JLOG_WARN("TURN over TLS requires SChannel support (built with USE_SCHANNEL on Windows)");
+		free(tc);
+		conn_impl->tcp[k] = NULL;
+		goto done;
+#endif
+	}
+
 	{
 		const char *label = tcp_framing_to_string(tc->framing);
 		char dst_str[ADDR_MAX_STRING_LEN];
@@ -722,6 +762,7 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_f
 		tc->sock = tcp_create_socket(dst);
 		if (tc->sock == INVALID_SOCKET) {
 			JLOG_WARN("%s socket creation failed for %s", label, dst_str);
+			tls_client_destroy(tc->tls);
 			free(tc);
 			conn_impl->tcp[k] = NULL;
 		} else {
