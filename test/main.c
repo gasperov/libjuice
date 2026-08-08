@@ -37,6 +37,7 @@ int test_tcp_ice_read_unit(void);
 int test_tcp_stun_read_unit(void);
 int test_tcp_stun_max_size(void);
 int test_tcp_ice_write_eagain(void);
+int test_tls_send_partial(void);
 int test_turn_tcp_fail(void);
 
 #ifndef NO_SERVER
@@ -167,6 +168,11 @@ int main(int argc, char **argv) {
 	printf("\nRunning ICE-TCP write EAGAIN sign test...\n");
 	if (test_tcp_ice_write_eagain()) {
 		fprintf(stderr, "ICE-TCP write EAGAIN sign test failed\n");
+		return -2;
+	}
+	printf("\nRunning TLS send-partial EWOULDBLOCK test...\n");
+	if (test_tls_send_partial()) {
+		fprintf(stderr, "TLS send-partial EWOULDBLOCK test failed\n");
 		return -2;
 	}
 	printf("\nRunning TURN TCP connection failure test...\n");

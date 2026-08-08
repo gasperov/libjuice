@@ -104,9 +104,27 @@ static void on_recv(juice_agent_t *agent, const char *data, size_t size, void *u
 	}
 }
 
+static const char *turn_transport_name(juice_turn_transport_t transport) {
+	switch (transport) {
+	case JUICE_TURN_TRANSPORT_UDP: return "UDP";
+	case JUICE_TURN_TRANSPORT_TCP: return "TCP";
+	case JUICE_TURN_TRANSPORT_TLS: return "TLS";
+	default:                       return "unknown";
+	}
+}
+
+static int add_turn_server(juice_agent_t *agent, const juice_turn_server_t *server,
+                           juice_turn_transport_t transport) {
+	switch (transport) {
+	case JUICE_TURN_TRANSPORT_TCP: return juice_add_turn_server_tcp(agent, server);
+	case JUICE_TURN_TRANSPORT_TLS: return juice_add_turn_server_tls(agent, server, false);
+	default:                       return juice_add_turn_server(agent, server);
+	}
+}
+
 static int run_relay_test(const char *name,
-                          const juice_turn_server_t *server1, bool is_tcp1,
-                          const juice_turn_server_t *server2, bool is_tcp2,
+                          const juice_turn_server_t *server1, juice_turn_transport_t transport1,
+                          const juice_turn_server_t *server2, juice_turn_transport_t transport2,
                           juice_concurrency_mode_t mode) {
 	printf("\n=== %s ===\n", name);
 
@@ -133,10 +151,16 @@ static int run_relay_test(const char *name,
 
 	ctx.agent1 = juice_create(&config1);
 	ctx.agent2 = juice_create(&config2);
-	if (is_tcp1) juice_add_turn_server_tcp(ctx.agent1, server1);
-	else         juice_add_turn_server(ctx.agent1, server1);
-	if (is_tcp2) juice_add_turn_server_tcp(ctx.agent2, server2);
-	else         juice_add_turn_server(ctx.agent2, server2);
+	bool added1 = add_turn_server(ctx.agent1, server1, transport1) == JUICE_ERR_SUCCESS;
+	bool added2 = add_turn_server(ctx.agent2, server2, transport2) == JUICE_ERR_SUCCESS;
+	if (!added1 || !added2) {
+		// E.g. TLS requested but the library wasn't built with USE_SCHANNEL: not a test
+		// failure, just unavailable in this build.
+		printf("%s: transport not available in this build, skipping\n", name);
+		juice_destroy(ctx.agent1);
+		juice_destroy(ctx.agent2);
+		return 0;
+	}
 
 	char sdp1[JUICE_MAX_SDP_STRING_LEN];
 	juice_get_local_description(ctx.agent1, sdp1, JUICE_MAX_SDP_STRING_LEN);
@@ -177,8 +201,8 @@ static int run_relay_test(const char *name,
 	       ctx.recv_count1, SEND_COUNT, ctx.recv_count2, SEND_COUNT);
 	success &= (ctx.recv_count1 >= SEND_COUNT && ctx.recv_count2 >= SEND_COUNT);
 
-	printf("Agent 1 TURN transport: %s\n", is_tcp1 ? "TCP" : "UDP");
-	printf("Agent 2 TURN transport: %s\n", is_tcp2 ? "TCP" : "UDP");
+	printf("Agent 1 TURN transport: %s\n", turn_transport_name(transport1));
+	printf("Agent 2 TURN transport: %s\n", turn_transport_name(transport2));
 
 	char local[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
 	char remote[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
@@ -247,6 +271,16 @@ int test_turn_relay() {
 	if (!turn_username2) turn_username2 = turn_username;
 	if (!turn_password2) turn_password2 = turn_password;
 
+	// TURNS (TURN over TLS) is a separate listener from plain TURN in any real deployment, so
+	// it gets its own env vars rather than falling back to TURN_HOST like TURN_HOST2 does; the
+	// TLS-specific cases below are skipped entirely (not failed) if these aren't set.
+	const char *turns_host = getenv("TURNS_HOST");
+	const char *turns_port_str = getenv("TURNS_PORT");
+	const char *turns_username = getenv("TURNS_USERNAME");
+	const char *turns_password = getenv("TURNS_PASSWORD");
+	bool have_turns = turns_host && turns_port_str && turns_username && turns_password;
+	uint16_t turns_port = have_turns ? (uint16_t)atoi(turns_port_str) : 0;
+
 	juice_set_log_level(JUICE_LOG_LEVEL_DEBUG);
 
 	uint16_t turn_port  = (uint16_t)atoi(turn_port_str);
@@ -273,21 +307,54 @@ int test_turn_relay() {
 		const char *mn = modes[m].mode_name;
 		char name[64];
 
-#define RUN(tcp1, tcp2, label) \
+#define RUN(t1, t2, label) \
 		{ \
 			MAKE_SERVER(s1, turn_host,  turn_port,  turn_username,  turn_password); \
 			MAKE_SERVER(s2, turn_host2, turn_port2, turn_username2, turn_password2); \
 			snprintf(name, sizeof(name), "TURN relay %s [%s]", label, mn); \
-			ret |= run_relay_test(name, &s1, tcp1, &s2, tcp2, mode); \
+			ret |= run_relay_test(name, &s1, t1, &s2, t2, mode); \
 			if (ret) return ret;\
 		}
 
-		RUN(false, false, "UDP/UDP")
-		RUN(true,  true,  "TCP/TCP")
-		RUN(true,  false, "TCP/UDP")
-		RUN(false, true,  "UDP/TCP")
+		RUN(JUICE_TURN_TRANSPORT_UDP, JUICE_TURN_TRANSPORT_UDP, "UDP/UDP")
+		RUN(JUICE_TURN_TRANSPORT_TCP, JUICE_TURN_TRANSPORT_TCP, "TCP/TCP")
+		RUN(JUICE_TURN_TRANSPORT_TCP, JUICE_TURN_TRANSPORT_UDP, "TCP/UDP")
+		RUN(JUICE_TURN_TRANSPORT_UDP, JUICE_TURN_TRANSPORT_TCP, "UDP/TCP")
 
 #undef RUN
+
+		// TLS/TLS uses the TURNS listener on both sides; the mixed cases pair it against the
+		// plain TURN listener, exercising TLS falling back alongside (and losing priority to,
+		// per RELAYED_TCP_PRIORITY_PENALTY) a UDP relay from the peer.
+		if (have_turns) {
+			{
+				MAKE_SERVER(s1, turns_host, turns_port, turns_username, turns_password);
+				MAKE_SERVER(s2, turns_host, turns_port, turns_username, turns_password);
+				snprintf(name, sizeof(name), "TURN relay TLS/TLS [%s]", mn);
+				ret |= run_relay_test(name, &s1, JUICE_TURN_TRANSPORT_TLS,
+				                      &s2, JUICE_TURN_TRANSPORT_TLS, mode);
+				if (ret) return ret;
+			}
+			{
+				MAKE_SERVER(s1, turns_host, turns_port, turns_username, turns_password);
+				MAKE_SERVER(s2, turn_host, turn_port, turn_username, turn_password);
+				snprintf(name, sizeof(name), "TURN relay TLS/UDP [%s]", mn);
+				ret |= run_relay_test(name, &s1, JUICE_TURN_TRANSPORT_TLS,
+				                      &s2, JUICE_TURN_TRANSPORT_UDP, mode);
+				if (ret) return ret;
+			}
+			{
+				MAKE_SERVER(s1, turn_host, turn_port, turn_username, turn_password);
+				MAKE_SERVER(s2, turns_host, turns_port, turns_username, turns_password);
+				snprintf(name, sizeof(name), "TURN relay UDP/TLS [%s]", mn);
+				ret |= run_relay_test(name, &s1, JUICE_TURN_TRANSPORT_UDP,
+				                      &s2, JUICE_TURN_TRANSPORT_TLS, mode);
+				if (ret) return ret;
+			}
+		} else {
+			printf("TURNS_HOST, TURNS_PORT, TURNS_USERNAME, and TURNS_PASSWORD not set; "
+			       "skipping TLS relay cases\n");
+		}
 	}
 
 #undef MAKE_SERVER

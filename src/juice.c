@@ -85,6 +85,18 @@ JUICE_EXPORT int juice_add_turn_server_tcp(juice_agent_t *agent,
 	return JUICE_ERR_SUCCESS;
 }
 
+JUICE_EXPORT int juice_add_turn_server_tls(juice_agent_t *agent,
+                                           const juice_turn_server_t *turn_server,
+                                           bool insecure_skip_verify) {
+	if (!agent || !turn_server)
+		return JUICE_ERR_INVALID;
+
+	if (agent_add_turn_server_tls(agent, turn_server, insecure_skip_verify) < 0)
+		return JUICE_ERR_FAILED;
+
+	return JUICE_ERR_SUCCESS;
+}
+
 JUICE_EXPORT int juice_set_remote_gathering_done(juice_agent_t *agent) {
 	if (!agent)
 		return JUICE_ERR_INVALID;
