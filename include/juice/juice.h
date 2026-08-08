@@ -80,6 +80,7 @@ typedef void (*juice_cb_mux_incoming_t)(const juice_mux_binding_request_t *info,
 typedef enum juice_turn_transport {
 	JUICE_TURN_TRANSPORT_UDP = 0,
 	JUICE_TURN_TRANSPORT_TCP = 1,
+	JUICE_TURN_TRANSPORT_TLS = 2, // Windows only, requires the library built with USE_SCHANNEL
 } juice_turn_transport_t;
 
 typedef struct juice_turn_server {
@@ -132,6 +133,9 @@ JUICE_EXPORT int juice_set_remote_description(juice_agent_t *agent, const char *
 JUICE_EXPORT int juice_add_remote_candidate(juice_agent_t *agent, const char *sdp);
 JUICE_EXPORT int juice_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_server);
 JUICE_EXPORT int juice_add_turn_server_tcp(juice_agent_t *agent, const juice_turn_server_t *turn_server);
+// insecure_skip_verify disables TLS certificate validation (e.g. self-signed relay certs)
+JUICE_EXPORT int juice_add_turn_server_tls(juice_agent_t *agent, const juice_turn_server_t *turn_server,
+                                           bool insecure_skip_verify);
 JUICE_EXPORT int juice_set_remote_gathering_done(juice_agent_t *agent);
 JUICE_EXPORT int juice_send(juice_agent_t *agent, const char *data, size_t size);
 JUICE_EXPORT int juice_send_diffserv(juice_agent_t *agent, const char *data, size_t size, int ds);

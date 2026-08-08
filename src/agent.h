@@ -37,6 +37,10 @@
 #define TURN_TCP_DELAY_START 1000
 // non-rfc: demote a relay reached over TURN-TCP by one local-preference rank (4096 << 8)
 #define RELAYED_TCP_PRIORITY_PENALTY (4096u << 8)
+// non-rfc: demote a relay reached over TURNS (TLS) by a further local-preference rank, on top of
+// RELAYED_TCP_PRIORITY_PENALTY (TLS entries are also "is_tcp"), since the TLS handshake and
+// per-record overhead make it strictly more expensive than plain TURN-TCP: UDP > TCP > TLS.
+#define RELAYED_TLS_PRIORITY_PENALTY (4096u << 8)
 
 // RFC 8445: Agents SHOULD use a Tr value of 15 seconds. Agents MAY use a bigger value but MUST NOT
 // use a value smaller than 15 seconds.
@@ -120,8 +124,13 @@ typedef struct agent_stun_entry {
 	timestamp_t next_transmission;
 	timediff_t retransmission_timeout;
 	int retransmissions;
-	bool transaction_id_expired;
 	tcp_state_t tcp_state;
+
+	bool transaction_id_expired;
+	bool tls; // relay entry reached over TURNS (TCP_FRAMING_STUN_TLS) rather than plain TURN-TCP
+	bool tls_insecure; // skip certificate validation; only meaningful when tls is set
+
+	const char *tls_hostname; // aliases juice_turn_server_t.host, valid for the agent's lifetime
 
 	// TURN
 	agent_turn_state_t *turn;
@@ -134,6 +143,9 @@ struct juice_agent {
 	juice_config_t config;
 	juice_turn_server_t *turn_servers_tcp;
 	int turn_servers_tcp_count;
+	juice_turn_server_t *turn_servers_tls;
+	int turn_servers_tls_count;
+	bool *turn_servers_tls_insecure; // parallel array to turn_servers_tls, same indexing
 	juice_state_t state;
 	agent_mode_t mode;
 	juice_ice_tcp_mode_t ice_tcp_mode;
@@ -174,6 +186,8 @@ int agent_add_remote_candidate(juice_agent_t *agent, const char *sdp);
 int agent_set_local_ice_attributes(juice_agent_t *agent, const char *ufrag, const char *pwd);
 int agent_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_server);
 int agent_add_turn_server_tcp(juice_agent_t *agent, const juice_turn_server_t *turn_server);
+int agent_add_turn_server_tls(juice_agent_t *agent, const juice_turn_server_t *turn_server,
+                              bool insecure_skip_verify);
 int agent_set_remote_gathering_done(juice_agent_t *agent);
 int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds);
 int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
