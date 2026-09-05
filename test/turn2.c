@@ -113,11 +113,16 @@ static const char *turn_transport_name(juice_turn_transport_t transport) {
 	}
 }
 
+static bool turns_insecure(void) {
+	const char *v = getenv("TURNS_INSECURE");
+	return v && *v && strcmp(v, "0") != 0;
+}
+
 static int add_turn_server(juice_agent_t *agent, const juice_turn_server_t *server,
                            juice_turn_transport_t transport) {
 	switch (transport) {
 	case JUICE_TURN_TRANSPORT_TCP: return juice_add_turn_server_tcp(agent, server);
-	case JUICE_TURN_TRANSPORT_TLS: return juice_add_turn_server_tls(agent, server, false);
+	case JUICE_TURN_TRANSPORT_TLS: return juice_add_turn_server_tls(agent, server, turns_insecure());
 	default:                       return juice_add_turn_server(agent, server);
 	}
 }
@@ -522,3 +527,109 @@ int test_turn_udp_preferred(void) {
 
 	return 0;
 }
+
+#if defined(_WIN32) && defined(USE_SCHANNEL)
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+static SOCKET make_blackhole_listener(uint16_t *out_port) {
+	SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock == INVALID_SOCKET)
+		return INVALID_SOCKET;
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = 0; // let the OS pick a free port
+
+	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(sock, 1) != 0) {
+		closesocket(sock);
+		return INVALID_SOCKET;
+	}
+
+	struct sockaddr_in bound;
+	int len = sizeof(bound);
+	if (getsockname(sock, (struct sockaddr *)&bound, &len) != 0) {
+		closesocket(sock);
+		return INVALID_SOCKET;
+	}
+	*out_port = ntohs(bound.sin_port);
+	return sock;
+}
+
+static void on_gathering_done_timeout(juice_agent_t *agent, void *user_ptr) {
+	(void)agent;
+	*(volatile int *)user_ptr = 1;
+}
+
+int test_turn_tls_handshake_timeout(void) {
+	printf("\n=== TURN TLS handshake timeout ===\n");
+
+	juice_set_log_level(JUICE_LOG_LEVEL_DEBUG);
+
+	volatile int gathering_done = 0;
+	juice_config_t config;
+	memset(&config, 0, sizeof(config));
+	config.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
+	config.cb_gathering_done = on_gathering_done_timeout;
+	config.user_ptr = (void *)&gathering_done;
+
+	// Before socket(): juice_create() does the WSAStartup the previous test's destroy undid
+	juice_agent_t *agent = juice_create(&config);
+
+	uint16_t port;
+	SOCKET listener = make_blackhole_listener(&port);
+	if (listener == INVALID_SOCKET) {
+		printf("Failed to create blackhole listener socket\n");
+		juice_destroy(agent);
+		return -1;
+	}
+
+	juice_turn_server_t server;
+	memset(&server, 0, sizeof(server));
+	server.host = "127.0.0.1";
+	server.port = port;
+	server.username = "test";
+	server.password = "test";
+
+	bool added = juice_add_turn_server_tls(agent, &server, true) == JUICE_ERR_SUCCESS;
+	if (!added) {
+		printf("TLS transport not available in this build, skipping\n");
+		closesocket(listener);
+		juice_destroy(agent);
+		return 0;
+	}
+
+	juice_gather_candidates(agent);
+
+	// TCP_CONNECT_TIMEOUT is 8000ms; this only proves gathering doesn't hang forever, so the
+	// margin here is generous rather than tight.
+	const int deadline_ms = 15000;
+	int elapsed_ms = 0;
+	for (; elapsed_ms < deadline_ms && !gathering_done; elapsed_ms += POLL_MS)
+		sleep_ms(POLL_MS);
+
+	closesocket(listener);
+	juice_destroy(agent);
+
+	if (!gathering_done) {
+		printf("Gathering did not complete within %d ms: handshake timeout not working?\n",
+		       deadline_ms);
+		return -1;
+	}
+
+	printf("Gathering completed after ~%d ms\n", elapsed_ms);
+	printf("TURN TLS handshake timeout: Success\n\n");
+	return 0;
+}
+
+#else
+
+int test_turn_tls_handshake_timeout(void) {
+	printf("USE_SCHANNEL not enabled, skipping TURN TLS handshake timeout test\n");
+	return 0;
+}
+
+#endif

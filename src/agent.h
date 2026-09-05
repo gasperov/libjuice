@@ -35,6 +35,8 @@
 
 // non-rfc: delay turn tcp startup
 #define TURN_TCP_DELAY_START 1000
+// non-rfc: backstop above tcp.h's TCP_CONNECT_TIMEOUT, which normally fails the connection first
+#define AGENT_TCP_CONNECT_TIMEOUT 10000 // msecs
 // non-rfc: demote a relay reached over TURN-TCP by one local-preference rank (4096 << 8)
 #define RELAYED_TCP_PRIORITY_PENALTY (4096u << 8)
 // non-rfc: demote a relay reached over TURNS (TLS) by a further local-preference rank, on top of
