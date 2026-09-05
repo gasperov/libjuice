@@ -12,6 +12,7 @@
 #include "addr.h"
 #include "juice.h"
 #include "socket.h"
+#include "timestamp.h"
 #include "tls_schannel.h"
 
 typedef enum tcp_state {
@@ -22,9 +23,17 @@ typedef enum tcp_state {
 	TCP_STATE_FAILED
 } tcp_state_t;
 
+// Bounds TCP connect + (if applicable) TLS handshake: a peer that accepts the TCP connection but
+// never completes the handshake (bad TLS config, silently dropped traffic, ...) would otherwise
+// leave the connection in TCP_STATE_CONNECTING/TLS_HANDSHAKING forever, with nothing to time it
+// out (no socket event ever fires once the peer goes silent).
+#define TCP_CONNECT_TIMEOUT 8000 // msecs
+
 socket_t tcp_create_socket(const addr_record_t *dst);
 
-#define TCP_BUFFER_SIZE 2048
+// Matches BUFFER_SIZE in agent.c/conn_poll.c, so anything that fits through the UDP relay path
+// also fits through TURN-TCP/TURNS.
+#define TCP_BUFFER_SIZE 4096
 
 // Extra room reserved in the buffers below for a TLS record header+trailer when framing runs
 // over TLS (TURNS), so a max-size plaintext message's ciphertext still fits in place. Real
@@ -85,6 +94,7 @@ typedef struct tcp_conn {
 	addr_record_t dst;
 	tcp_state_t state;
 	tls_client_t *tls; // NULL unless framing == TCP_FRAMING_STUN_TLS
+	timestamp_t connect_deadline; // valid while state is CONNECTING or TLS_HANDSHAKING
 } tcp_conn_t;
 
 const char *tcp_state_to_string(tcp_state_t state);

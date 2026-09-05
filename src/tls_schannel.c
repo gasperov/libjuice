@@ -86,6 +86,10 @@ tls_cipher_state_t *tls_client_cipher_state(tls_client_t *tls) {
 	return &tls->cipher;
 }
 
+bool tls_client_wants_write(const tls_client_t *tls) {
+	return tls->out_buf != NULL;
+}
+
 // Sends buf[*off..len), advancing *off as bytes go out. Returns 1 once *off reaches len, 0 if
 // the non-blocking socket's send buffer is full (progress so far already recorded in *off, so a
 // later call with the same buf/len/off resumes correctly), or -1 on fatal error. No allocation.
@@ -130,10 +134,9 @@ int tls_client_handshake(tls_client_t *tls, socket_t sock) {
 		SCHANNEL_CRED cred;
 		memset(&cred, 0, sizeof(cred));
 		cred.dwVersion = SCHANNEL_CRED_VERSION;
+		// SCHANNEL_CRED cannot enable TLS 1.3; requesting it makes AcquireCredentialsHandle
+		// fail with SEC_E_ALGORITHM_MISMATCH on some Windows builds.
 		cred.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT;
-#ifdef SP_PROT_TLS1_3_CLIENT
-		cred.grbitEnabledProtocols |= SP_PROT_TLS1_3_CLIENT;
-#endif
 		cred.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | (tls->insecure_skip_verify
 		                                                 ? SCH_CRED_MANUAL_CRED_VALIDATION
 		                                                 : SCH_CRED_AUTO_CRED_VALIDATION);
@@ -305,7 +308,8 @@ int tls_encode(tls_client_t *tls, char *buf, size_t buf_capacity, size_t plain_s
 // Decrypts one TLS record from buf[0..len) in place. On success (1), *out_plaintext points
 // within buf (no copy) and *out_plaintext_len is its size; *out_consumed is how many bytes of
 // buf that record occupied (EXTRA, if any, is always the trailing buf[*out_consumed..len)).
-// Returns 0 if buf does not yet hold a complete record, <0 on fatal error.
+// Returns 2 on the peer's close_notify, 0 if buf does not yet hold a complete record, <0 on
+// fatal error.
 int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
                size_t *out_plaintext_len, size_t *out_consumed) {
 	if (len == 0)
@@ -331,7 +335,12 @@ int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
 		*out_plaintext = NULL;
 		*out_plaintext_len = 0;
 		*out_consumed = len;
-		return 1; // peer sent close_notify; caller treats the empty result as EOF
+		return 2; // peer sent close_notify
+	}
+
+	if (status == SEC_I_RENEGOTIATE) {
+		JLOG_WARN("TLS peer requested renegotiation, not supported");
+		return -1;
 	}
 
 	if (status != SEC_E_OK) {

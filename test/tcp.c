@@ -166,7 +166,7 @@ int test_tcp() {
 	}
 }
 
-static int make_tcp_loopback_pair(socket_t *wr, socket_t *rd) {
+static int make_tcp_loopback_pair_buf(socket_t *wr, socket_t *rd, int bufsize) {
 	struct sockaddr_in addr;
 	socklen_t len;
 	socket_t server, client, accepted;
@@ -185,6 +185,9 @@ static int make_tcp_loopback_pair(socket_t *wr, socket_t *rd) {
 	}
 
 	setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+
+	if (bufsize > 0)
+		setsockopt(server, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsize, sizeof(bufsize));
 
 	if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
 		printf("make_tcp_loopback_pair: bind() failed errno=%d\n", sockerrno);
@@ -207,6 +210,9 @@ static int make_tcp_loopback_pair(socket_t *wr, socket_t *rd) {
 		printf("make_tcp_loopback_pair: client socket() failed errno=%d\n", sockerrno);
 		goto error_server;
 	}
+
+	if (bufsize > 0)
+		setsockopt(client, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
 
 	// Use non-blocking connect so we can call accept() on the same thread
 	// without risking a deadlock if the kernel waits for accept before
@@ -252,6 +258,10 @@ static int make_tcp_loopback_pair(socket_t *wr, socket_t *rd) {
 error_server:
 	closesocket(server);
 	return -1;
+}
+
+static int make_tcp_loopback_pair(socket_t *wr, socket_t *rd) {
+	return make_tcp_loopback_pair_buf(wr, rd, 0);
 }
 
 static int tcp_ice_read_retry(socket_t rd, tcp_read_context_t *ctx) {
@@ -814,14 +824,9 @@ int test_tcp_ice_write_eagain(void) {
 }
 
 #if defined(_WIN32) && defined(USE_SCHANNEL)
-// tls_client_handshake() used to treat any send() failure while flushing a handshake token as
-// fatal, including EWOULDBLOCK on the non-blocking socket every TURNS connection actually uses.
-// This verifies the extracted send-with-resume helper correctly reports EWOULDBLOCK as "not
-// done yet" (0, with progress already recorded in *off) rather than as an error, and that a
-// later call resumes and completes from that same offset.
 int test_tls_send_partial(void) {
 	socket_t wr, rd;
-	if (make_tcp_loopback_pair(&wr, &rd) != 0) {
+	if (make_tcp_loopback_pair_buf(&wr, &rd, 4096) != 0) {
 		printf("Failure: socket pair\n");
 		return -1;
 	}
@@ -830,11 +835,6 @@ int test_tls_send_partial(void) {
 	// return EWOULDBLOCK instead of blocking this thread.
 	ctl_t nbio = 1;
 	ioctlsocket(wr, FIONBIO, &nbio);
-
-	// Shrink both ends' buffers so a modest payload is enough to force EWOULDBLOCK.
-	int small_buf = 4096;
-	setsockopt(wr, SOL_SOCKET, SO_SNDBUF, (const char *)&small_buf, sizeof(small_buf));
-	setsockopt(rd, SOL_SOCKET, SO_RCVBUF, (const char *)&small_buf, sizeof(small_buf));
 
 	size_t big_size = 1024 * 1024; // comfortably exceeds the shrunk buffers
 	char *big = (char *)malloc(big_size);
@@ -846,19 +846,34 @@ int test_tls_send_partial(void) {
 	for (size_t i = 0; i < big_size; ++i)
 		big[i] = (char)(i & 0xFF);
 
+	{
+		int sndbuf = 0, rcvbuf = 0;
+		socklen_t optlen = sizeof(int);
+		getsockopt(wr, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, &optlen);
+		optlen = sizeof(int);
+		getsockopt(rd, SOL_SOCKET, SO_RCVBUF, (char *)&rcvbuf, &optlen);
+		printf("Effective buffers: SO_SNDBUF=%d SO_RCVBUF=%d\n", sndbuf, rcvbuf);
+	}
+
+	size_t stuffed = 0;
+	while (stuffed < 64 * 1024 * 1024) {
+		int n = send(wr, big, (int)big_size, 0);
+		if (n < 0)
+			break; // EWOULDBLOCK: full
+		stuffed += (size_t)n;
+	}
+
+	char drain[8192];
 	size_t off = 0;
 	int ret = _juice_tls_send_partial(wr, big, big_size, &off);
-	if (ret != 0 || off == 0 || off >= big_size) {
-		printf("Failure: expected a partial send (0 < off < %zu) with ret=0 (EWOULDBLOCK), "
-		       "got ret=%d off=%zu\n", big_size, ret, off);
+	if (ret != 0) {
+		printf("Failure: expected EWOULDBLOCK reported as 0, got ret=%d off=%zu after stuffing "
+		       "%zu bytes\n", ret, off, stuffed);
 		free(big); closesocket(wr); closesocket(rd);
 		return -1;
 	}
-	printf("First send_partial: %zu/%zu bytes before EWOULDBLOCK\n", off, big_size);
+	printf("Blocked as expected: off=%zu/%zu (stuffed %zu)\n", off, big_size, stuffed);
 
-	// Drain the receiver and resume from the same off, exactly as tls_client_handshake() does
-	// on the next poll() readiness event, until fully sent (bounded for safety).
-	char drain[8192];
 	int rounds = 0;
 	while (ret == 0 && rounds++ < 1000) {
 		while (recv(rd, drain, sizeof(drain), 0) > 0) {
@@ -869,14 +884,54 @@ int test_tls_send_partial(void) {
 			Sleep(1);
 	}
 
-	free(big);
-
 	if (ret != 1 || off != big_size) {
 		printf("Failure: send_partial did not complete, ret=%d off=%zu/%zu\n", ret, off, big_size);
-		closesocket(wr); closesocket(rd);
+		free(big); closesocket(wr); closesocket(rd);
+		return -1;
+	}
+	printf("Resumed to completion: off=%zu/%zu\n", off, big_size);
+
+	closesocket(wr);
+	closesocket(rd);
+	if (make_tcp_loopback_pair(&wr, &rd) != 0) {
+		printf("Failure: socket pair (resume phase)\n");
+		free(big);
+		return -1;
+	}
+	nbio = 1;
+	ioctlsocket(wr, FIONBIO, &nbio);
+
+	const size_t small_size = 1024;
+	const size_t start = 400;
+	size_t roff = start;
+	ret = _juice_tls_send_partial(wr, big, small_size, &roff);
+	if (ret != 1 || roff != small_size) {
+		printf("Failure: resume from offset did not complete, ret=%d off=%zu/%zu\n", ret, roff,
+		       small_size);
+		free(big); closesocket(wr); closesocket(rd);
 		return -1;
 	}
 
+	char got[1024];
+	size_t received = 0;
+	int spins = 0;
+	while (received < small_size - start && spins++ < 1000) {
+		int n = recv(rd, got + received, (int)(small_size - start - received), 0);
+		if (n > 0)
+			received += (size_t)n;
+		else
+			Sleep(1);
+	}
+
+	if (received != small_size - start || memcmp(got, big + start, small_size - start) != 0) {
+		printf("Failure: resume sent wrong bytes, received %zu of %zu expected\n", received,
+		       small_size - start);
+		free(big); closesocket(wr); closesocket(rd);
+		return -1;
+	}
+	printf("Resume from offset %zu sent the correct %zu bytes\n", start, small_size - start);
+
+	free(big);
 	closesocket(wr);
 	closesocket(rd);
 	printf("Success\n");

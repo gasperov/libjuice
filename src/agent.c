@@ -402,7 +402,7 @@ static void agent_resolve_turn_servers(juice_agent_t *agent, juice_turn_server_t
 			continue;
 
 		if (!turn_server->port)
-			turn_server->port = 3478; // default TURN port
+			turn_server->port = tls ? 5349 : 3478; // default TURN port
 
 		char hostname[256];
 		char service[8];
@@ -436,17 +436,21 @@ static void agent_resolve_turn_servers(juice_agent_t *agent, juice_turn_server_t
 			if (record) {
 				bool is_duplicate = false;
 				for (int k = 0; k < agent->entries_count; ++k) {
-					agent_stun_entry_t *entry = agent->entries + k;
-					if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
-					    addr_record_is_equal(&entry->record, record, true)) {
+					agent_stun_entry_t *other = agent->entries + k;
+					if (other->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
+					    addr_record_is_equal(&other->record, record, true)) {
 						is_duplicate = true;
+						if (other->tls != tls)
+							JLOG_WARN("TURN server %s:%s over %s ignored: this address is already "
+							          "used over %s, configure a distinct port",
+							          hostname, service, proto, other->tls ? "TLS" : "TCP");
+						else
+							JLOG_INFO("Duplicate TURN server, ignoring");
 						break;
 					}
 				}
-				if (is_duplicate) {
-					JLOG_INFO("Duplicate TURN server, ignoring");
+				if (is_duplicate)
 					continue;
-				}
 
 				JLOG_VERBOSE("Registering STUN entry %d for relay request",
 				             agent->entries_count);
@@ -766,6 +770,7 @@ int agent_add_turn_server_tls(juice_agent_t *agent, const juice_turn_server_t *t
 		return -1;
 	}
 #if !defined(_WIN32) || !defined(USE_SCHANNEL)
+	(void)turn_server;
 	(void)insecure_skip_verify;
 	JLOG_WARN("TURN over TLS requires SChannel support (built with USE_SCHANNEL on Windows)");
 	return -1;
@@ -1014,6 +1019,17 @@ void agent_register_entry_for_candidate_pair(juice_agent_t *agent, ice_candidate
 		agent_translate_host_candidate_entry(agent, entry);
 }
 
+static void agent_fail_tcp_entry(juice_agent_t *agent, agent_stun_entry_t *entry) {
+	entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+	entry->next_transmission = 0;
+
+	if (entry->pair)
+		entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
+
+	if (entry->type != AGENT_STUN_ENTRY_TYPE_CHECK)
+		agent_update_gathering_done(agent);
+}
+
 int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_state_t state) {
 	for (int i = 0; i < agent->entries_count; ++i) {
 		agent_stun_entry_t *entry = agent->entries + i;
@@ -1021,19 +1037,12 @@ int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_sta
 			entry->tcp_state = state;
 			switch (state) {
 			case TCP_STATE_CONNECTED:
-				agent_arm_transmission(agent, entry, 0); // transmit now
+				if (entry->state == AGENT_STUN_ENTRY_STATE_PENDING)
+					agent_arm_transmission(agent, entry, 0); // transmit now
 				break;
 			case TCP_STATE_DISCONNECTED:
 			case TCP_STATE_FAILED:
-				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-				entry->next_transmission = 0;
-
-				if(entry->pair)
-					entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
-
-				if (entry->type != AGENT_STUN_ENTRY_TYPE_CHECK)
-					agent_update_gathering_done(agent);
-
+				agent_fail_tcp_entry(agent, entry);
 				conn_interrupt(agent);
 				break;
 			default:
@@ -1064,7 +1073,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 				continue;
 
 			if (entry_is_tcp(entry)) {
-			    if (entry->tcp_state == TCP_STATE_DISCONNECTED) {
+				if (entry->tcp_state == TCP_STATE_DISCONNECTED) {
 					// First attempt a TCP connection
 					tcp_framing_t framing = TCP_FRAMING_ICE;
 					if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY)
@@ -1072,10 +1081,23 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 					conn_tcp_connect(agent, &entry->record, framing,
 					                entry->tls ? entry->tls_hostname : NULL,
 					                entry->tls && entry->tls_insecure);
+
+					if (entry->tcp_state == TCP_STATE_DISCONNECTED) {
+						JLOG_INFO("STUN entry %d: TCP connection could not be initiated", i);
+						agent_fail_tcp_entry(agent, entry);
+						continue;
+					}
+
+					// Otherwise next_transmission stays in the past and the poll loop spins
+					entry->next_transmission = now + AGENT_TCP_CONNECT_TIMEOUT;
+					continue;
 				}
 
-				if(entry->tcp_state != TCP_STATE_CONNECTED)
+				if (entry->tcp_state != TCP_STATE_CONNECTED) {
+					JLOG_INFO("STUN entry %d: TCP connection timed out", i);
+					agent_fail_tcp_entry(agent, entry);
 					continue;
+				}
 			}
 
 			if (entry->retransmissions >= 0) {
@@ -2078,8 +2100,13 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			// found, then the client considers the current transaction as failed and reattempts the
 			// request with the server specified in the attribute, using the same transport protocol
 			// used for the previous request.
-			if (!msg->alternate_server.len ||
-			    addr_record_is_equal(&msg->alternate_server, &entry->record, true)) {
+			// Parsed STUN addresses always carry SOCK_DGRAM; keep this entry's own transport so
+			// the comparison below and entry_is_tcp() afterwards stay correct.
+			addr_record_t alternate_server = msg->alternate_server;
+			alternate_server.socktype = entry->record.socktype;
+
+			if (!alternate_server.len ||
+			    addr_record_is_equal(&alternate_server, &entry->record, true)) {
 				JLOG_ERROR("Expected alternate server in TURN Allocate 300 Try Alternate response");
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 				agent_update_gathering_done(agent);
@@ -2102,7 +2129,9 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 
 			// Change record and resend request when possible
 			++entry->turn_redirections;
-			entry->record = msg->alternate_server;
+			entry->record = alternate_server;
+			if (entry_is_tcp(entry))
+				entry->tcp_state = TCP_STATE_DISCONNECTED; // reconnect
 			agent_arm_transmission(agent, entry, 0);
 
 		} else {
