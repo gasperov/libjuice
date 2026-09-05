@@ -220,51 +220,59 @@ int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_conte
 // recv()-compatible contract (>0 bytes copied, 0 on orderly close, negative incl. -SEAGAIN),
 // backed by TLS instead of the raw socket. A single STUN/ChannelData message can need bytes from
 // more than one TLS record, and a single decoded record can hold more plaintext than the current
-// message still needs, so the cipher state's buf holds, in order: [0..plain_len) plaintext
-// already decoded but not yet delivered, then [plain_len..len) raw ciphertext not yet decoded.
+// message still needs, so delivering it can take several calls. Rather than shifting the cipher
+// state's buffer on every partial read, off/plain_off just advance in place; recv() is never
+// reached while plain_len > 0 (the branch below always returns first), so the two regions never
+// need to coexist past this point, and the buffer is only ever compacted once there is no room
+// left to receive into, not on every consume.
 static int tcp_stun_tls_recv(tls_client_t *tls, socket_t sock, char *dst, uint32_t cap) {
 	tls_cipher_state_t *cs = tls_client_cipher_state(tls);
 
 	for (;;) {
 		if (cs->plain_len > 0) {
 			uint32_t n = cs->plain_len < cap ? cs->plain_len : cap;
-			memcpy(dst, cs->buf, n);
-			uint32_t remainder = cs->len - n;
-			if (remainder > 0)
-				memmove(cs->buf, cs->buf + n, remainder);
+			memcpy(dst, cs->buf + cs->plain_off, n);
+			cs->plain_off += n;
 			cs->plain_len -= n;
-			cs->len -= n;
 			return (int)n;
 		}
 
 		if (cs->len > 0) {
 			char *pt;
 			size_t pt_len, consumed;
-			int ret = tls_decode(tls, cs->buf, cs->len, &pt, &pt_len, &consumed);
+			int ret = tls_decode(tls, cs->buf + cs->off, cs->len, &pt, &pt_len, &consumed);
 			if (ret < 0)
 				return -SECONNRESET;
 			if (ret == 1) {
 				size_t extra = cs->len - consumed;
-				// pt aliases cs->buf, after the record's header: close that gap, then close the
-				// gap left by the consumed header+trailer for any leftover ciphertext too.
-				if (pt_len > 0)
-					memmove(cs->buf, pt, pt_len);
-				if (extra > 0)
-					memmove(cs->buf + pt_len, cs->buf + consumed, extra);
 				if (pt_len == 0 && extra == 0)
 					return 0; // peer's close_notify: reported as a valid, empty record
+				// pt already points within buf (decryption happens in place); extra, if any, is
+				// the tail of the same input region, so advancing off past what was consumed
+				// lines it up without moving anything.
+				cs->plain_off = (uint32_t)(pt - cs->buf);
 				cs->plain_len = (uint32_t)pt_len;
-				cs->len = (uint32_t)(pt_len + extra);
+				cs->off += (uint32_t)consumed;
+				cs->len = (uint32_t)extra;
 				continue; // deliver from the newly decoded plaintext above
 			}
 			// ret == 0: not a complete record yet, read more below
 		}
 
-		if (cs->len >= sizeof(cs->buf)) {
-			JLOG_WARN("TLS record exceeds internal buffer");
-			return -SECONNRESET;
+		uint32_t tail_free = (uint32_t)sizeof(cs->buf) - cs->off - cs->len;
+		if (tail_free == 0) {
+			if (cs->off == 0) {
+				// Not just out of trailing room: this record's ciphertext alone doesn't fit even
+				// in a fully-compacted buffer.
+				JLOG_WARN("TLS record exceeds internal buffer");
+				return -SECONNRESET;
+			}
+			memmove(cs->buf, cs->buf + cs->off, cs->len);
+			cs->off = 0;
+			tail_free = (uint32_t)sizeof(cs->buf) - cs->len;
 		}
-		int n = recv(sock, cs->buf + cs->len, (int)(sizeof(cs->buf) - cs->len), 0);
+
+		int n = recv(sock, cs->buf + cs->off + cs->len, (int)tail_free, 0);
 		if (n < 0) {
 			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
 				return -SEAGAIN;

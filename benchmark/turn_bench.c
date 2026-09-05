@@ -119,11 +119,17 @@ static void on_recv(juice_agent_t *agent, const char *data, size_t size, void *u
 	++ctx->recv_count2;
 }
 
+// Set to skip TLS certificate validation, e.g. against a self-signed test relay
+static bool turns_insecure(void) {
+	const char *v = getenv("TURNS_INSECURE");
+	return v && *v && strcmp(v, "0") != 0;
+}
+
 static int add_turn_server(juice_agent_t *agent, const juice_turn_server_t *server,
                            juice_turn_transport_t transport) {
 	switch (transport) {
 	case JUICE_TURN_TRANSPORT_TCP: return juice_add_turn_server_tcp(agent, server);
-	case JUICE_TURN_TRANSPORT_TLS: return juice_add_turn_server_tls(agent, server, false);
+	case JUICE_TURN_TRANSPORT_TLS: return juice_add_turn_server_tls(agent, server, turns_insecure());
 	default:                       return juice_add_turn_server(agent, server);
 	}
 }

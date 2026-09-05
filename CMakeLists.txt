@@ -262,6 +262,14 @@ if(NOT NO_TESTS)
 	if(WIN32)
 		target_link_libraries(juice-tests ws2_32)
 	endif()
+
+	if (NO_SERVER)
+		target_compile_definitions(juice-tests PRIVATE NO_SERVER)
+	endif()
+
+	if (USE_SCHANNEL)
+		target_compile_definitions(juice-tests PRIVATE USE_SCHANNEL=1)	
+	endif()
 endif()
 
 # Benchmark
