@@ -25,6 +25,7 @@ int test_gathering(void);
 int test_turn(void);
 int test_turn_relay(void);
 int test_turn_udp_preferred(void);
+int test_turn_tls_handshake_timeout(void);
 int test_conflict(void);
 int test_nomination_repeated(void);
 int test_bind(void);
@@ -101,6 +102,12 @@ int main(int argc, char **argv) {
 	printf("\nRunning TURN UDP-preferred test...\n");
 	if (test_turn_udp_preferred()) {
 		fprintf(stderr, "TURN UDP-preferred test failed\n");
+		return -1;
+	}
+
+	printf("\nRunning TURN TLS handshake timeout test...\n");
+	if (test_turn_tls_handshake_timeout()) {
+		fprintf(stderr, "TURN TLS handshake timeout test failed\n");
 		return -1;
 	}
 

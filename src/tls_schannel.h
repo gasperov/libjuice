@@ -28,12 +28,20 @@ typedef struct tls_client tls_client_t;
 
 // Data-phase ciphertext/plaintext staging buffer for one connection, embedded in and owned by
 // its tls_client_t, reached via tls_client_cipher_state() so tcp.c can drive the recv-side
-// accumulation loop itself instead of tls_schannel.c owning socket I/O. buf holds, in order:
-// [0..plain_len) plaintext already decoded but not yet consumed by the caller, then
-// [plain_len..len) raw ciphertext accumulated from the socket but not yet decoded.
+// accumulation loop itself instead of tls_schannel.c owning socket I/O. Holds two independently
+// positioned regions: [off..off+len) is ciphertext accumulated from the socket but not yet
+// decoded, and [plain_off..plain_off+plain_len) is plaintext already decoded but not yet consumed
+// by the caller (only meaningful while plain_len > 0). Decrypting in place leaves the plaintext
+// wherever SChannel put it rather than at a fixed offset, and the two regions are only ever
+// relevant one at a time (the ciphertext region is untouched by the caller while plaintext is
+// being drained), so tcp.c can advance off/plain_off as data is consumed instead of physically
+// shifting the buffer on every partial read; see tcp_stun_tls_recv() for where the one remaining
+// compaction (reclaiming leading space before recv()) happens.
 typedef struct tls_cipher_state {
 	char buf[TLS_CIPHER_BUFFER_SIZE];
+	uint32_t off;
 	uint32_t len;
+	uint32_t plain_off;
 	uint32_t plain_len;
 } tls_cipher_state_t;
 
@@ -55,6 +63,10 @@ int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
 // Returns this connection's cipher state (len/plain_len start at 0), valid for the lifetime of
 // tls.
 tls_cipher_state_t *tls_client_cipher_state(tls_client_t *tls);
+
+// True while a partially-sent handshake token is pending flush, i.e. the handshake needs the
+// socket to become writable; otherwise it is waiting to read the server's next flight.
+bool tls_client_wants_write(const tls_client_t *tls);
 
 // Export for tests. Sends buf[*off..len), advancing *off as bytes go out. Returns 1 once *off
 // reaches len, 0 if the socket would still block (progress so far already recorded in *off, so
@@ -82,6 +94,10 @@ static inline void tls_client_destroy(tls_client_t *tls) { (void)tls; }
 static inline tls_cipher_state_t *tls_client_cipher_state(tls_client_t *tls) {
 	(void)tls;
 	return NULL;
+}
+static inline bool tls_client_wants_write(const tls_client_t *tls) {
+	(void)tls;
+	return false;
 }
 
 #endif // _WIN32 && USE_SCHANNEL
