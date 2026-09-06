@@ -469,21 +469,31 @@ void conn_poll_change_tcp_fail(juice_agent_t *agent, tcp_conn_t *tc) {
 }
 
 void conn_poll_change_tcp_state(juice_agent_t *agent, tcp_conn_t *tc, tcp_state_t state) {
-	if (tc->state != state) {
-		JLOG_DEBUG("%s state changed to %s", tcp_framing_to_string(tc->framing),
-		          tcp_state_to_string(state));
-		tc->state = state;
-		if (agent_conn_tcp_state(agent, &tc->dst, state) != 0) {
-			conn_impl_t *conn_impl = agent->conn_impl;
-			mutex_lock(&conn_impl->send_mutex);
-			if (tc->sock != INVALID_SOCKET) {
-				closesocket(tc->sock);
-				tc->sock = INVALID_SOCKET;
-			}
-			tcp_conn_reset(tc);
-			tc->state = TCP_STATE_DISCONNECTED;
-			mutex_unlock(&conn_impl->send_mutex);
+	if (tc->state == state)
+		return;
+
+	conn_impl_t *conn_impl = agent->conn_impl;
+	JLOG_DEBUG("%s state changed to %s", tcp_framing_to_string(tc->framing),
+	           tcp_state_to_string(state));
+	tc->state = state;
+	if (agent_conn_tcp_state(agent, &tc->dst, state) != 0) {
+		mutex_lock(&conn_impl->send_mutex);
+		if (tc->sock != INVALID_SOCKET) {
+			closesocket(tc->sock);
+			tc->sock = INVALID_SOCKET;
 		}
+		tcp_conn_reset(tc);
+		tc->state = TCP_STATE_DISCONNECTED;
+		mutex_unlock(&conn_impl->send_mutex);
+		return;
+	}
+
+	// CONNECTED arms the entry to transmit now; refresh next_timestamp so poll() doesn't sleep
+	// out the connect backstop. The guard also breaks recursion via agent_conn_update().
+	if (state == TCP_STATE_CONNECTED &&
+	    agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
+		JLOG_WARN("Agent update failed");
+		conn_impl->state = CONN_STATE_FINISHED;
 	}
 }
 
