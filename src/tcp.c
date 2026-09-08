@@ -87,8 +87,12 @@ int tcp_ice_write(socket_t sock, const char *data, size_t size, tcp_write_contex
 			len = send(sock, context->buffer + (context->bytes_written - 2), context->length - (context->bytes_written - 2), flags);
 		}
 
-		if (len < 0)
-			return len;
+		if (len < 0) {
+			int ret = sockerrno;
+			if (ret != SEAGAIN && ret != SEWOULDBLOCK)
+				JLOG_DEBUG("TCP send failed, errno=%d", ret);
+			return -ret;
+		}
 
 		context->bytes_written += len;
 	}
@@ -133,10 +137,10 @@ int tcp_ice_read(socket_t sock, tcp_read_context_t *context) {
 		}
 
 		if (len < 0) {
-			if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
-				JLOG_DEBUG("TCP recv failed, errno=%d", sockerrno);
-
-			return -sockerrno;
+			int ret = sockerrno;
+			if (ret != SEAGAIN && ret != SEWOULDBLOCK)
+				JLOG_DEBUG("TCP recv failed, errno=%d", ret);
+			return -ret;
 		}
 
 		if (len == 0)
@@ -205,9 +209,10 @@ int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_conte
 		int len = send(sock, context->buffer + context->bytes_written,
 		               context->send_length - context->bytes_written, flags);
 		if (len < 0) {
-			if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
-				JLOG_DEBUG("TCP send failed, errno=%d", sockerrno);
-			return -sockerrno;
+			int ret = sockerrno;
+			if (ret != SEAGAIN && ret != SEWOULDBLOCK)
+				JLOG_DEBUG("TCP send failed, errno=%d", ret);
+			return -ret;
 		}
 
 		context->bytes_written += (uint16_t)len;
@@ -274,9 +279,10 @@ static int tcp_stun_tls_recv(tls_client_t *tls, socket_t sock, char *dst, uint32
 
 		int n = recv(sock, cs->buf + cs->off + cs->len, (int)tail_free, 0);
 		if (n < 0) {
-			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
+			int ret = sockerrno;
+			if (ret == SEAGAIN || ret == SEWOULDBLOCK)
 				return -SEAGAIN;
-			return -sockerrno;
+			return -ret;
 		}
 		if (n == 0)
 			return 0; // closed
@@ -324,9 +330,10 @@ int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls)
 		if (len < 0) {
 			if (tls)
 				return len; // already a signed error code, not a raw sockerrno to translate
-			if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
-				JLOG_DEBUG("TCP recv failed, errno=%d", sockerrno);
-			return -sockerrno;
+			int ret = sockerrno;
+			if (ret != SEAGAIN && ret != SEWOULDBLOCK)
+				JLOG_DEBUG("TCP recv failed, errno=%d", ret);
+			return -ret;
 		}
 		if (len == 0)
 			return 0; // closed

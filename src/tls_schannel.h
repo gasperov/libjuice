@@ -68,6 +68,22 @@ tls_cipher_state_t *tls_client_cipher_state(tls_client_t *tls);
 // socket to become writable; otherwise it is waiting to read the server's next flight.
 bool tls_client_wants_write(const tls_client_t *tls);
 
+// Internal adapter returns bytes sent or a negative socket error. Passing it per call lets
+// tests exercise the production flush loop without relying on OS buffer sizes or timing.
+typedef int (*tls_send_func_t)(void *user_ptr, const char *buf, size_t len);
+static inline int tls_send_partial_with(tls_send_func_t send_func, void *user_ptr,
+                                        const char *buf, size_t len, size_t *off) {
+	while (*off < len) {
+		int n = send_func(user_ptr, buf + *off, len - *off);
+		if (n == -SEAGAIN || n == -SEWOULDBLOCK)
+			return 0;
+		if (n <= 0)
+			return -1;
+		*off += (size_t)n;
+	}
+	return 1;
+}
+
 // Export for tests. Sends buf[*off..len), advancing *off as bytes go out. Returns 1 once *off
 // reaches len, 0 if the socket would still block (progress so far already recorded in *off, so
 // a later call with the same buf/len/off resumes correctly), <0 on fatal error. No allocation.
