@@ -37,12 +37,9 @@
 #define TURN_TCP_DELAY_START 1000
 // non-rfc: backstop above tcp.h's TCP_CONNECT_TIMEOUT, which normally fails the connection first
 #define AGENT_TCP_CONNECT_TIMEOUT 10000 // msecs
-// non-rfc: demote a relay reached over TURN-TCP by one local-preference rank (4096 << 8)
-#define RELAYED_TCP_PRIORITY_PENALTY (4096u << 8)
-// non-rfc: demote a relay reached over TURNS (TLS) by a further local-preference rank, on top of
-// RELAYED_TCP_PRIORITY_PENALTY (TLS entries are also "is_tcp"), since the TLS handshake and
-// per-record overhead make it strictly more expensive than plain TURN-TCP: UDP > TCP > TLS.
-#define RELAYED_TLS_PRIORITY_PENALTY (4096u << 8)
+// ice_compute_priority() uses at most 13 local-preference bits for a UDP relay candidate.
+// Reserve a full range per TURN transport, preserving family/index order within each range.
+#define RELAYED_LOCAL_PREFERENCE_STRIDE 8192u
 
 // RFC 8445: Agents SHOULD use a Tr value of 15 seconds. Agents MAY use a bigger value but MUST NOT
 // use a value smaller than 15 seconds.
