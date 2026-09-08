@@ -47,6 +47,7 @@ typedef struct conn_mode_entry {
 	                 int ds);
 	void (*tcp_connect_func)(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing,
 	                        const char *tls_hostname, bool tls_insecure_skip_verify);
+	void (*tcp_close_func)(juice_agent_t *agent, const addr_record_t *dst);
 	int (*get_addrs_func)(juice_agent_t *agent, addr_record_t *records, size_t size);
 	int (*mux_listen_func)(conn_registry_t *registry, juice_cb_mux_incoming_t cb, void *user_ptr);
 	conn_registry_t *(*get_registry_func)(udp_socket_config_t *config);
@@ -67,6 +68,8 @@ int conn_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, 
 // tls_hostname/tls_insecure_skip_verify are only used when framing == TCP_FRAMING_STUN_TLS
 void conn_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing,
                       const char *tls_hostname, bool tls_insecure_skip_verify);
+// Release a connection without notifying the agent of a terminal failure (e.g. on redirect).
+void conn_tcp_close(juice_agent_t *agent, const addr_record_t *dst);
 int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
 
 #endif

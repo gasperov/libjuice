@@ -93,17 +93,14 @@ bool tls_client_wants_write(const tls_client_t *tls) {
 // Sends buf[*off..len), advancing *off as bytes go out. Returns 1 once *off reaches len, 0 if
 // the non-blocking socket's send buffer is full (progress so far already recorded in *off, so a
 // later call with the same buf/len/off resumes correctly), or -1 on fatal error. No allocation.
+static int tls_socket_send(void *user_ptr, const char *buf, size_t len) {
+	socket_t sock = *(socket_t *)user_ptr;
+	int n = send(sock, buf, (int)len, 0);
+	return n < 0 ? -sockerrno : n;
+}
+
 static int tls_send_partial(socket_t sock, const char *buf, size_t len, size_t *off) {
-	while (*off < len) {
-		int n = send(sock, buf + *off, (int)(len - *off), 0);
-		if (n < 0) {
-			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
-				return 0;
-			return -1;
-		}
-		*off += (size_t)n;
-	}
-	return 1;
+	return tls_send_partial_with(tls_socket_send, &sock, buf, len, off);
 }
 
 // Resumes/starts flushing tls->out_buf (if any) to sock. Returns 1 once fully flushed (freeing
