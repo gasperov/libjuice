@@ -824,119 +824,95 @@ int test_tcp_ice_write_eagain(void) {
 }
 
 #if defined(_WIN32) && defined(USE_SCHANNEL)
+typedef struct tls_send_script {
+	const char *data;
+	int step;
+} tls_send_script_t;
+
+static int tls_scripted_send(void *user_ptr, const char *buf, size_t len) {
+	tls_send_script_t *script = user_ptr;
+	static const struct { size_t offset; int result; } writes[] = {
+	    {0, 7}, {7, -SEAGAIN}, {7, -SEWOULDBLOCK}, {7, 17}, {0, -SECONNRESET}, {0, 0}};
+	if (script->step >= (int)(sizeof(writes) / sizeof(writes[0])))
+		return -SECONNRESET;
+	size_t offset = writes[script->step].offset;
+	if (buf != script->data + offset || len != strlen(script->data) - offset)
+		return -SECONNRESET;
+	return writes[script->step++].result;
+}
+
+#define TLS_CHECK(condition) do { \
+	if (!(condition)) { \
+		printf("TLS partial send failed at line %d: %s\n", __LINE__, #condition); \
+		return -1; \
+	} \
+} while (0)
+
 int test_tls_send_partial(void) {
-	socket_t wr, rd;
-	if (make_tcp_loopback_pair_buf(&wr, &rd, 4096) != 0) {
-		printf("Failure: socket pair\n");
-		return -1;
-	}
-
-	// make_tcp_loopback_pair leaves the writer blocking; make it non-blocking so send() can
-	// return EWOULDBLOCK instead of blocking this thread.
-	ctl_t nbio = 1;
-	ioctlsocket(wr, FIONBIO, &nbio);
-
-	size_t big_size = 1024 * 1024; // comfortably exceeds the shrunk buffers
-	char *big = (char *)malloc(big_size);
-	if (!big) {
-		printf("Failure: alloc\n");
-		closesocket(wr); closesocket(rd);
-		return -1;
-	}
-	for (size_t i = 0; i < big_size; ++i)
-		big[i] = (char)(i & 0xFF);
-
-	{
-		int sndbuf = 0, rcvbuf = 0;
-		socklen_t optlen = sizeof(int);
-		getsockopt(wr, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, &optlen);
-		optlen = sizeof(int);
-		getsockopt(rd, SOL_SOCKET, SO_RCVBUF, (char *)&rcvbuf, &optlen);
-		printf("Effective buffers: SO_SNDBUF=%d SO_RCVBUF=%d\n", sndbuf, rcvbuf);
-	}
-
-	size_t stuffed = 0;
-	while (stuffed < 64 * 1024 * 1024) {
-		int n = send(wr, big, (int)big_size, 0);
-		if (n < 0)
-			break; // EWOULDBLOCK: full
-		stuffed += (size_t)n;
-	}
-
-	char drain[8192];
+	const char token[] = "0123456789abcdefghijklmn";
+	const size_t len = sizeof(token) - 1;
+	tls_send_script_t script = {token, 0};
 	size_t off = 0;
-	int ret = _juice_tls_send_partial(wr, big, big_size, &off);
-	if (ret != 0) {
-		printf("Failure: expected EWOULDBLOCK reported as 0, got ret=%d off=%zu after stuffing "
-		       "%zu bytes\n", ret, off, stuffed);
-		free(big); closesocket(wr); closesocket(rd);
+	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 0);
+	TLS_CHECK(off == 7 && script.step == 2);
+	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 0);
+	TLS_CHECK(off == 7 && script.step == 3);
+	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 1);
+	TLS_CHECK(off == len && script.step == 4);
+	// A completed token must not be sent again; fatal and zero-byte sends must stop.
+	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 1);
+	TLS_CHECK(script.step == 4);
+	off = 0;
+	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == -1);
+	TLS_CHECK(off == 0 && script.step == 5);
+	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == -1);
+	TLS_CHECK(off == 0 && script.step == 6);
+
+	// Exercise the production socket adapter too. Check delivery and offset handling,
+	// without assuming that a particular write must block on this operating system.
+	socket_t wr, rd;
+	if (make_tcp_loopback_pair(&wr, &rd) != 0)
+		return -1;
+	ctl_t nbio = 1;
+	if (ioctlsocket(wr, FIONBIO, &nbio) != 0) {
+		closesocket(wr);
+		closesocket(rd);
 		return -1;
 	}
-	printf("Blocked as expected: off=%zu/%zu (stuffed %zu)\n", off, big_size, stuffed);
-
-	int rounds = 0;
-	while (ret == 0 && rounds++ < 1000) {
-		while (recv(rd, drain, sizeof(drain), 0) > 0) {
-			// discard
-		}
-		ret = _juice_tls_send_partial(wr, big, big_size, &off);
-		if (ret == 0)
-			Sleep(1);
-	}
-
-	if (ret != 1 || off != big_size) {
-		printf("Failure: send_partial did not complete, ret=%d off=%zu/%zu\n", ret, off, big_size);
-		free(big); closesocket(wr); closesocket(rd);
-		return -1;
-	}
-	printf("Resumed to completion: off=%zu/%zu\n", off, big_size);
-
-	closesocket(wr);
-	closesocket(rd);
-	if (make_tcp_loopback_pair(&wr, &rd) != 0) {
-		printf("Failure: socket pair (resume phase)\n");
-		free(big);
-		return -1;
-	}
-	nbio = 1;
-	ioctlsocket(wr, FIONBIO, &nbio);
-
-	const size_t small_size = 1024;
+	char data[16384], received[sizeof(data)];
+	for (size_t i = 0; i < sizeof(data); ++i)
+		data[i] = (char)(i & 0xFF);
 	const size_t start = 400;
-	size_t roff = start;
-	ret = _juice_tls_send_partial(wr, big, small_size, &roff);
-	if (ret != 1 || roff != small_size) {
-		printf("Failure: resume from offset did not complete, ret=%d off=%zu/%zu\n", ret, roff,
-		       small_size);
-		free(big); closesocket(wr); closesocket(rd);
-		return -1;
-	}
-
-	char got[1024];
-	size_t received = 0;
-	int spins = 0;
-	while (received < small_size - start && spins++ < 1000) {
-		int n = recv(rd, got + received, (int)(small_size - start - received), 0);
+	off = start;
+	size_t count = 0;
+	int ret = 0;
+	ULONGLONG deadline = GetTickCount64() + 5000;
+	while (GetTickCount64() < deadline) {
+		if (ret == 0)
+			ret = _juice_tls_send_partial(wr, data, sizeof(data), &off);
+		if (ret < 0)
+			break;
+		int n = recv(rd, received + count, (int)(sizeof(received) - count), 0);
 		if (n > 0)
-			received += (size_t)n;
-		else
-			Sleep(1);
+			count += (size_t)n;
+		else if (n == 0 || (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK))
+			break;
+		if (count >= sizeof(data) - start)
+			break;
+		struct pollfd pfds[2] = {{wr, ret == 0 ? POLLOUT : 0, 0}, {rd, POLLIN, 0}};
+		if (poll(pfds, 2, 10) < 0)
+			break;
 	}
-
-	if (received != small_size - start || memcmp(got, big + start, small_size - start) != 0) {
-		printf("Failure: resume sent wrong bytes, received %zu of %zu expected\n", received,
-		       small_size - start);
-		free(big); closesocket(wr); closesocket(rd);
-		return -1;
-	}
-	printf("Resume from offset %zu sent the correct %zu bytes\n", start, small_size - start);
-
-	free(big);
 	closesocket(wr);
 	closesocket(rd);
-	printf("Success\n");
+	TLS_CHECK(ret == 1 && off == sizeof(data));
+	TLS_CHECK(count == sizeof(data) - start);
+	TLS_CHECK(memcmp(received, data + start, count) == 0);
+	printf("Success: scripted TLS backpressure and loopback delivery\n");
 	return 0;
 }
+
+#undef TLS_CHECK
 #else
 int test_tls_send_partial(void) {
 	printf("SChannel not built (USE_SCHANNEL); skipping\n");

@@ -29,6 +29,7 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
                         int ds);
 void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing,
                            const char *tls_hostname, bool tls_insecure_skip_verify);
+void conn_poll_tcp_close(juice_agent_t *agent, const addr_record_t *dst);
 int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
 
 #endif

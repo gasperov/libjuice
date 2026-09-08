@@ -78,8 +78,7 @@ static bool entry_is_tcp(const agent_stun_entry_t *entry) {
 	return entry->record.socktype == SOCK_STREAM;
 }
 
-// Relay transport preference tier, lowest is best: UDP < TURN-TCP < TURNS (TLS). Mirrors
-// RELAYED_TCP_PRIORITY_PENALTY/RELAYED_TLS_PRIORITY_PENALTY.
+// Relay transport preference tier, lowest is best: UDP < TURN-TCP < TURNS (TLS).
 static int relay_entry_rank(const agent_stun_entry_t *entry) {
 	if (!entry_is_tcp(entry))
 		return 0;
@@ -1019,7 +1018,11 @@ void agent_register_entry_for_candidate_pair(juice_agent_t *agent, ice_candidate
 		agent_translate_host_candidate_entry(agent, entry);
 }
 
-static void agent_fail_tcp_entry(juice_agent_t *agent, agent_stun_entry_t *entry) {
+static void agent_fail_stun_entry(juice_agent_t *agent, agent_stun_entry_t *entry) {
+	if (entry_is_tcp(entry)) {
+		conn_tcp_close(agent, &entry->record);
+		entry->tcp_state = TCP_STATE_FAILED;
+	}
 	entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 	entry->next_transmission = 0;
 
@@ -1042,7 +1045,7 @@ int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_sta
 				break;
 			case TCP_STATE_DISCONNECTED:
 			case TCP_STATE_FAILED:
-				agent_fail_tcp_entry(agent, entry);
+				agent_fail_stun_entry(agent, entry);
 				conn_interrupt(agent);
 				break;
 			default:
@@ -1084,7 +1087,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 					if (entry->tcp_state == TCP_STATE_DISCONNECTED) {
 						JLOG_INFO("STUN entry %d: TCP connection could not be initiated", i);
-						agent_fail_tcp_entry(agent, entry);
+						agent_fail_stun_entry(agent, entry);
 						continue;
 					}
 
@@ -1095,7 +1098,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 				if (entry->tcp_state != TCP_STATE_CONNECTED) {
 					JLOG_INFO("STUN entry %d: TCP connection timed out", i);
-					agent_fail_tcp_entry(agent, entry);
+					agent_fail_stun_entry(agent, entry);
 					continue;
 				}
 			}
@@ -1144,6 +1147,10 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 			// Failure sending or end of retransmissions
 			JLOG_DEBUG("STUN entry %d: Failed", i);
+			if (entry_is_tcp(entry)) {
+				conn_tcp_close(agent, &entry->record);
+				entry->tcp_state = TCP_STATE_FAILED;
+			}
 			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 			entry->next_transmission = 0;
 
@@ -1992,7 +1999,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 
 		if (!msg->relayed.len) {
 			JLOG_ERROR("Expected relayed address in TURN Allocate response");
-			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+			agent_fail_stun_entry(agent, entry);
 			return -1;
 		}
 
@@ -2007,7 +2014,8 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			agent_arm_keepalive(agent, entry);
 		}
 
-		if (msg->mapped.len) {
+		// A TCP/TLS mapping belongs to the stream socket, not our UDP ICE socket.
+		if (msg->mapped.len && !entry_is_tcp(entry)) {
 			JLOG_VERBOSE("Response has mapped address");
 
 			if (JLOG_INFO_ENABLED) {
@@ -2025,6 +2033,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 		entry->relayed = msg->relayed;
 		if (agent_add_local_relayed_candidate(agent, entry)) {
 			JLOG_WARN("Failed to add local relayed candidate from TURN relayed address");
+			agent_fail_stun_entry(agent, entry);
 			return -1;
 		}
 
@@ -2061,14 +2070,12 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			           msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh");
 			if (*entry->turn->credentials.realm != '\0') {
 				JLOG_ERROR("TURN authentication failed");
-				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-				agent_update_gathering_done(agent);
+				agent_fail_stun_entry(agent, entry);
 				return -1;
 			}
 			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
 				JLOG_ERROR("Expected realm and nonce in TURN error response");
-				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-				agent_update_gathering_done(agent);
+				agent_fail_stun_entry(agent, entry);
 				return -1;
 			}
 
@@ -2082,8 +2089,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			           msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh");
 			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
 				JLOG_ERROR("Expected realm and nonce in TURN error response");
-				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-				agent_update_gathering_done(agent);
+				agent_fail_stun_entry(agent, entry);
 				return -1;
 			}
 
@@ -2108,15 +2114,13 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			if (!alternate_server.len ||
 			    addr_record_is_equal(&alternate_server, &entry->record, true)) {
 				JLOG_ERROR("Expected alternate server in TURN Allocate 300 Try Alternate response");
-				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-				agent_update_gathering_done(agent);
+				agent_fail_stun_entry(agent, entry);
 				return -1;
 			}
 			// Prevent infinite redirection loop
 			if (entry->turn_redirections >= MAX_TURN_REDIRECTIONS) {
 				JLOG_ERROR("Too many redirections for TURN Allocate");
-				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-				agent_update_gathering_done(agent);
+				agent_fail_stun_entry(agent, entry);
 				return -1;
 			}
 
@@ -2129,6 +2133,8 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 
 			// Change record and resend request when possible
 			++entry->turn_redirections;
+			if (entry_is_tcp(entry))
+				conn_tcp_close(agent, &entry->record);
 			entry->record = alternate_server;
 			if (entry_is_tcp(entry))
 				entry->tcp_state = TCP_STATE_DISCONNECTED; // reconnect
@@ -2141,8 +2147,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 				          (unsigned int)msg->error_code);
 
 			JLOG_INFO("TURN allocation failed");
-			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-			agent_update_gathering_done(agent);
+			agent_fail_stun_entry(agent, entry);
 		}
 		break;
 	}
@@ -2474,10 +2479,10 @@ int agent_add_local_relayed_candidate(juice_agent_t *agent, const agent_stun_ent
 		return -1;
 	}
 
-	if (entry_is_tcp(entry) && candidate.priority >= RELAYED_TCP_PRIORITY_PENALTY)
-		candidate.priority -= RELAYED_TCP_PRIORITY_PENALTY;
-	if (entry->tls && candidate.priority >= RELAYED_TLS_PRIORITY_PENALTY)
-		candidate.priority -= RELAYED_TLS_PRIORITY_PENALTY;
+	// Disjoint local-preference ranges guarantee UDP > TCP > TLS even when the less
+	// preferred transport allocates first or has a preferred address family.
+	unsigned rank = (unsigned)relay_entry_rank(entry);
+	candidate.priority += (2u - rank) * (RELAYED_LOCAL_PREFERENCE_STRIDE << 8);
 
 	if (ice_add_candidate(&candidate, &agent->local)) {
 		JLOG_ERROR("Failed to add candidate to local description");
