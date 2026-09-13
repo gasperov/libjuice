@@ -404,6 +404,7 @@ void tcp_conn_init(tcp_conn_t *tc, tcp_framing_t framing) {
 	tc->state = TCP_STATE_DISCONNECTED;
 	tc->framing = framing;
 	tc->tls = NULL;
+	tc->read_pending = false;
 	memset(&tc->dst, 0, sizeof(tc->dst));
 	memset(&tc->write, 0, sizeof(tc->write));
 	memset(&tc->read,  0, sizeof(tc->read));
@@ -412,6 +413,7 @@ void tcp_conn_init(tcp_conn_t *tc, tcp_framing_t framing) {
 void tcp_conn_reset(tcp_conn_t *tc) {
 	tls_client_destroy(tc->tls);
 	tc->tls = NULL;
+	tc->read_pending = false;
 	memset(&tc->write, 0, sizeof(tc->write));
 	memset(&tc->read,  0, sizeof(tc->read));
 }
