@@ -16,12 +16,19 @@
 
 #include <assert.h>
 #include <string.h>
+#include <time.h>
 
 #define BUFFER_SIZE 4096
 
 typedef struct registry_impl {
 	thread_t thread;
-	uint64_t generation; // socket membership changes; protected by the registry mutex
+	bool sockets_changed; // socket membership changes; poll thread only
+	juice_agent_t **poll_agents;
+	int poll_agents_count;
+	int poll_agents_size;
+	atomic(bool) sync_requested;
+	atomic(bool) stopping;
+	atomic(bool) exited;
 #ifdef _WIN32
 	socket_t interrupt_sock;
 #else
@@ -32,6 +39,13 @@ typedef struct registry_impl {
 
 typedef enum conn_state { CONN_STATE_NEW = 0, CONN_STATE_READY, CONN_STATE_FINISHED } conn_state_t;
 
+typedef enum poll_state {
+	POLL_STATE_ADD_REQUESTED = 1,
+	POLL_STATE_ACTIVE,
+	POLL_STATE_REMOVE_REQUESTED,
+	POLL_STATE_RELEASED
+} poll_state_t;
+
 // One generic TCP connection per ICE-TCP candidate plus one per TURN TCP relay. The connection to
 // use for a given destination is found by address; the only per-connection difference is framing.
 #define CONN_MAX_TCP (1 + MAX_RELAY_ENTRIES_COUNT)
@@ -41,15 +55,17 @@ typedef struct conn_impl {
 	conn_state_t state;
 	socket_t udp_sock;
 	tcp_conn_t *tcp[CONN_MAX_TCP];
+	mutex_t agent_mutex;
 	mutex_t send_mutex;
 	int send_ds;
 	timestamp_t next_timestamp;
+	atomic(bool) wake;
+	atomic(int) poll_state;
 } conn_impl_t;
 
 typedef struct pfds_record {
 	struct pollfd *pfds;
 	nfds_t size;
-	uint64_t generation;
 } pfds_record_t;
 
 int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_t *next_timestamp);
@@ -66,6 +82,37 @@ static thread_return_t THREAD_CALL conn_thread_entry(void *arg) {
 	conn_registry_t *registry = (conn_registry_t *)arg;
 	conn_poll_run(registry);
 	return (thread_return_t)0;
+}
+
+static int conn_poll_wake(registry_impl_t *registry_impl) {
+	JLOG_VERBOSE("Interrupting connections thread");
+
+	char dummy = 0;
+#ifdef _WIN32
+	if (udp_sendto_self(registry_impl->interrupt_sock, &dummy, 0) < 0) {
+		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
+			JLOG_WARN("Failed to interrupt poll by triggering socket, errno=%d", sockerrno);
+		}
+		return -1;
+	}
+#else
+	if (write(registry_impl->interrupt_pipe_out, &dummy, 1) < 0 && errno != EAGAIN &&
+	    errno != EWOULDBLOCK) {
+		JLOG_WARN("Failed to interrupt poll by writing to pipe, errno=%d", errno);
+	}
+#endif
+	return 0;
+}
+
+static void conn_poll_sleep_ms(unsigned int ms) {
+#ifdef _WIN32
+	Sleep(ms);
+#else
+	struct timespec ts;
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+	nanosleep(&ts, NULL);
+#endif
 }
 
 int conn_poll_registry_init(conn_registry_t *registry, udp_socket_config_t *config) {
@@ -124,6 +171,9 @@ error:
 void conn_poll_registry_cleanup(conn_registry_t *registry) {
 	registry_impl_t *registry_impl = registry->impl;
 
+	atomic_store(&registry_impl->stopping, true);
+	conn_poll_wake(registry_impl);
+
 	JLOG_VERBOSE("Waiting for connections thread");
 	thread_join(registry_impl->thread, NULL);
 
@@ -133,6 +183,7 @@ void conn_poll_registry_cleanup(conn_registry_t *registry) {
 	close(registry_impl->interrupt_pipe_out);
 	close(registry_impl->interrupt_pipe_in);
 #endif
+	free(registry_impl->poll_agents);
 	free(registry->impl);
 	registry->impl = NULL;
 }
@@ -147,7 +198,7 @@ static tcp_conn_t *conn_poll_find_tcp(conn_impl_t *conn_impl, const addr_record_
 	return NULL;
 }
 
-// The registry mutex must be held. Keep the slot object alive until any receive callback
+// Poll thread only. Keep the slot object alive until any receive callback
 // returns; closing/reusing a socket invalidates the poll snapshot even if its fd is recycled.
 static void conn_poll_close_tcp(conn_impl_t *conn_impl, tcp_conn_t *tc) {
 	registry_impl_t *registry_impl = conn_impl->registry->impl;
@@ -155,7 +206,7 @@ static void conn_poll_close_tcp(conn_impl_t *conn_impl, tcp_conn_t *tc) {
 	if (tc->sock != INVALID_SOCKET) {
 		closesocket(tc->sock);
 		tc->sock = INVALID_SOCKET;
-		++registry_impl->generation;
+		registry_impl->sockets_changed = true;
 	}
 	tcp_conn_reset(tc);
 	tc->state = TCP_STATE_DISCONNECTED;
@@ -163,21 +214,72 @@ static void conn_poll_close_tcp(conn_impl_t *conn_impl, tcp_conn_t *tc) {
 	mutex_unlock(&conn_impl->send_mutex);
 }
 
+static int conn_poll_sync_agents(conn_registry_t *registry, registry_impl_t *registry_impl) {
+	int count = 0;
+	for (int i = 0; i < registry_impl->poll_agents_count; ++i) {
+		juice_agent_t *agent = registry_impl->poll_agents[i];
+		conn_impl_t *conn_impl = agent->conn_impl;
+		if (atomic_load(&conn_impl->poll_state) == POLL_STATE_REMOVE_REQUESTED)
+			atomic_store(&conn_impl->poll_state, POLL_STATE_RELEASED);
+		else
+			registry_impl->poll_agents[count++] = agent;
+	}
+	registry_impl->poll_agents_count = count;
+
+	for (int j = 0; j < registry->agents_size; ++j) {
+		juice_agent_t *agent = registry->agents[j];
+		if (!agent || !agent->conn_impl)
+			continue;
+
+		conn_impl_t *conn_impl = agent->conn_impl;
+		int state = atomic_load(&conn_impl->poll_state);
+		if (state == POLL_STATE_REMOVE_REQUESTED) {
+			atomic_store(&conn_impl->poll_state, POLL_STATE_RELEASED);
+		} else if (state == POLL_STATE_ADD_REQUESTED) {
+			if (registry_impl->poll_agents_count == registry_impl->poll_agents_size) {
+				int new_size = registry_impl->poll_agents_size > 0 ? registry_impl->poll_agents_size * 2 : 16;
+				juice_agent_t **new_agents =
+				    realloc(registry_impl->poll_agents, new_size * sizeof(juice_agent_t *));
+				if (!new_agents) {
+					JLOG_FATAL("Memory allocation for poll agents failed");
+					return -1;
+				}
+				registry_impl->poll_agents = new_agents;
+				registry_impl->poll_agents_size = new_size;
+			}
+			registry_impl->poll_agents[registry_impl->poll_agents_count++] = agent;
+			atomic_store(&conn_impl->poll_state, POLL_STATE_ACTIVE);
+		}
+	}
+	return 0;
+}
+
+static int conn_poll_update_agents(conn_registry_t *registry) {
+	registry_impl_t *registry_impl = registry->impl;
+	if (atomic_load(&registry_impl->sync_requested)) {
+		mutex_lock(&registry->mutex);
+		atomic_store(&registry_impl->sync_requested, false);
+		int ret = conn_poll_sync_agents(registry, registry_impl);
+		mutex_unlock(&registry->mutex);
+		if (ret)
+			return -1;
+	}
+	return atomic_load(&registry_impl->stopping) ? -1 : 0;
+}
+
 int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_t *next_timestamp) {
+	registry_impl_t *registry_impl = registry->impl;
 	timestamp_t now = current_timestamp();
 	*next_timestamp = now + 60000;
 
-	mutex_lock(&registry->mutex);
-	nfds_t size = 1;
-	for (int i = 0; i < registry->agents_size; ++i) {
-		juice_agent_t *agent = registry->agents[i];
-		if (!agent) {
-			continue;
-		}
+	if (conn_poll_update_agents(registry))
+		return -1;
 
+	nfds_t size = 1;
+	for (int i = 0; i < registry_impl->poll_agents_count; ++i) {
+		juice_agent_t *agent = registry_impl->poll_agents[i];
 		conn_impl_t *conn_impl = agent->conn_impl;
-		if (!conn_impl ||
-		    (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)) {
+		if (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY) {
 			continue;
 		}
 
@@ -190,7 +292,9 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 			if (tc->state == TCP_STATE_CONNECTING || tc->state == TCP_STATE_TLS_HANDSHAKING) {
 				if (now >= tc->connect_deadline) {
 					JLOG_INFO("%s connect/handshake timed out", tcp_framing_to_string(tc->framing));
+					mutex_lock(&conn_impl->agent_mutex);
 					conn_poll_change_tcp_fail(agent, tc);
+					mutex_unlock(&conn_impl->agent_mutex);
 					continue;
 				}
 				if (*next_timestamp > tc->connect_deadline)
@@ -204,13 +308,12 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		struct pollfd *new_pfds = realloc(pfds->pfds, sizeof(struct pollfd) * size);
 		if (!new_pfds) {
 			JLOG_FATAL("Memory allocation for poll file descriptors failed");
-			goto error;
+			return -1;
 		}
 		pfds->pfds = new_pfds;
 		pfds->size = size;
 	}
 
-	registry_impl_t *registry_impl = registry->impl;
 	struct pollfd *interrupt_pfd = pfds->pfds;
 	assert(interrupt_pfd);
 #ifdef _WIN32
@@ -221,18 +324,19 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 	interrupt_pfd->events = POLLIN;
 
 	nfds_t i = 1;
-	for (int j = 0; j < registry->agents_size; ++j) {
-		juice_agent_t *agent = registry->agents[j];
-		if (!agent)
-			continue;
-
+	for (int j = 0; j < registry_impl->poll_agents_count; ++j) {
+		juice_agent_t *agent = registry_impl->poll_agents[j];
 		conn_impl_t *conn_impl = agent->conn_impl;
-		if (!conn_impl ||
-		    (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY))
+		if (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)
 			continue;
 
 		if (conn_impl->state == CONN_STATE_NEW)
 			conn_impl->state = CONN_STATE_READY;
+
+		if (atomic_load(&conn_impl->wake)) {
+			atomic_store(&conn_impl->wake, false);
+			conn_impl->next_timestamp = now;
+		}
 
 		if (*next_timestamp > conn_impl->next_timestamp)
 			*next_timestamp = conn_impl->next_timestamp;
@@ -251,6 +355,8 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 			}
 			struct pollfd *tcp_pfd = pfds->pfds + i;
 			tcp_pfd->fd = tc->sock;
+			if (tc->read_pending)
+				*next_timestamp = now;
 			if (tc->state == TCP_STATE_CONNECTING) {
 				tcp_pfd->events = POLLOUT;
 			} else if (tc->state == TCP_STATE_TLS_HANDSHAKING) {
@@ -259,21 +365,18 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 					tcp_pfd->events |= POLLOUT;
 			} else {
 				tcp_pfd->events = POLLIN;
+				mutex_lock(&conn_impl->send_mutex);
 				if (tc->write.pending) {
 					tcp_pfd->events |= POLLOUT;
 				}
+				mutex_unlock(&conn_impl->send_mutex);
 			}
 			i++;
 		}
 	}
 
-	pfds->generation = registry_impl->generation;
-	mutex_unlock(&registry->mutex);
+	registry_impl->sockets_changed = false;
 	return size - 1;
-
-error:
-	mutex_unlock(&registry->mutex);
-	return -1;
 }
 
 void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
@@ -411,23 +514,27 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 	}
 
 	if (pfd->revents & POLLOUT) {
+		mutex_lock(&conn_impl->send_mutex);
+		int ret = 0;
 		if (tc->write.pending) {
-			int ret = self_delimited
+			ret = self_delimited
 			    ? tcp_stun_write(tc->sock, NULL, 0, &tc->write, tc->tls)
 			    : tcp_ice_write(tc->sock, NULL, 0, &tc->write);
-			if (ret >= 0) {
+			if (ret >= 0)
 				JLOG_DEBUG("Finished sending %s message", label);
-			} else if (ret != -SEAGAIN && ret != -SEWOULDBLOCK) {
-				JLOG_WARN("%s send failed, errno=%d", label, -ret);
-				conn_poll_change_tcp_fail(agent, tc);
-				return;
-			}
+		}
+		mutex_unlock(&conn_impl->send_mutex);
+		if (ret < 0 && ret != -SEAGAIN && ret != -SEWOULDBLOCK) {
+			JLOG_WARN("%s send failed, errno=%d", label, -ret);
+			conn_poll_change_tcp_fail(agent, tc);
+			return;
 		}
 	}
 
-	if (pfd->revents & POLLIN) {
+	if (pfd->revents & POLLIN || tc->read_pending) {
 		int ret = 0;
 		int left = 1000; // limit for fairness between sockets
+		tc->read_pending = false;
 		while (left--) {
 			ret = self_delimited
 				? tcp_stun_read(tc->sock, &tc->read, tc->tls)
@@ -452,6 +559,7 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 		if (ret > 0) {
 			// There are more datagrams but we need to give other sockets a turn
 			JLOG_VERBOSE("Fairness limit reached, will continue on next poll");
+			tc->read_pending = true;
 		} else if (ret == -SEAGAIN || ret == -SEWOULDBLOCK) {
 			JLOG_VERBOSE("No more %s datagrams to receive", label);
 		} else {
@@ -488,11 +596,15 @@ void conn_poll_change_tcp_state(juice_agent_t *agent, tcp_conn_t *tc, tcp_state_
 		return;
 
 	conn_impl_t *conn_impl = agent->conn_impl;
+	mutex_lock(&conn_impl->agent_mutex);
 	JLOG_DEBUG("%s state changed to %s", tcp_framing_to_string(tc->framing),
 	           tcp_state_to_string(state));
+	mutex_lock(&conn_impl->send_mutex);
 	tc->state = state;
+	mutex_unlock(&conn_impl->send_mutex);
 	if (agent_conn_tcp_state(agent, &tc->dst, state) != 0) {
 		conn_poll_close_tcp(conn_impl, tc);
+		mutex_unlock(&conn_impl->agent_mutex);
 		return;
 	}
 
@@ -503,6 +615,7 @@ void conn_poll_change_tcp_state(juice_agent_t *agent, tcp_conn_t *tc, tcp_state_
 		JLOG_WARN("Agent update failed");
 		conn_impl->state = CONN_STATE_FINISHED;
 	}
+	mutex_unlock(&conn_impl->agent_mutex);
 }
 
 int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
@@ -523,19 +636,11 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 #endif
 	}
 
-	mutex_lock(&registry->mutex);
-
-	if (pfds->generation != registry_impl->generation)
-		goto done;
-
 	nfds_t i = 1;
-	for (int j = 0; j < registry->agents_size; ++j) {
-		juice_agent_t *agent = registry->agents[j];
-		if (!agent)
-			continue;
-
+	for (int j = 0; j < registry_impl->poll_agents_count; ++j) {
+		juice_agent_t *agent = registry_impl->poll_agents[j];
 		conn_impl_t *conn_impl = agent->conn_impl;
-		if (!conn_impl || (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY))
+		if (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)
 			continue;
 
 		if (i >= pfds->size)
@@ -545,12 +650,18 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 		if (udp_pfd->fd != conn_impl->udp_sock)
 			break;
 
+		mutex_lock(&conn_impl->agent_mutex);
+
+		if (atomic_load(&conn_impl->wake)) {
+			atomic_store(&conn_impl->wake, false);
+			conn_impl->next_timestamp = current_timestamp();
+		}
+
 		conn_poll_process_udp(agent, udp_pfd);
-		if (pfds->generation != registry_impl->generation)
-			goto done;
+		bool stale = registry_impl->sockets_changed;
 		i++;
 
-		for (int k = 0; k < CONN_MAX_TCP; ++k) {
+		for (int k = 0; !stale && k < CONN_MAX_TCP; ++k) {
 			tcp_conn_t *tc = conn_impl->tcp[k];
 			if (!tc || tc->sock == INVALID_SOCKET)
 				continue;
@@ -561,15 +672,16 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 			struct pollfd *tcp_pfd = pfds->pfds + i;
 			if (tcp_pfd->fd == tc->sock) {
 				conn_poll_process_tcp(agent, tcp_pfd, tc);
-				if (pfds->generation != registry_impl->generation)
-					goto done;
+				stale = registry_impl->sockets_changed;
 				i++;
 			}
 		}
+
+		mutex_unlock(&conn_impl->agent_mutex);
+		if (stale)
+			break;
 	}
 
-done:
-	mutex_unlock(&registry->mutex);
 	return 0;
 }
 
@@ -577,10 +689,9 @@ int conn_poll_run(conn_registry_t *registry) {
 	pfds_record_t pfds;
 	pfds.pfds = NULL;
 	pfds.size = 0;
-	pfds.generation = 0;
 	timestamp_t next_timestamp = 0;
 	int count;
-	while ((count = conn_poll_prepare(registry, &pfds, &next_timestamp)) > 0) {
+	while ((count = conn_poll_prepare(registry, &pfds, &next_timestamp)) >= 0) {
 		timediff_t timediff = next_timestamp - current_timestamp();
 		if (timediff < 0)
 			timediff = 0;
@@ -607,6 +718,7 @@ int conn_poll_run(conn_registry_t *registry) {
 	}
 
 	JLOG_DEBUG("Leaving connections thread");
+	atomic_store(&((registry_impl_t *)registry->impl)->exited, true);
 	free(pfds.pfds);
 	return 0;
 }
@@ -625,21 +737,32 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 		return -1;
 	}
 
+	mutex_init(&conn_impl->agent_mutex, MUTEX_RECURSIVE);
 	mutex_init(&conn_impl->send_mutex, 0);
 	conn_impl->registry = registry;
 	
+	atomic_store(&conn_impl->poll_state, POLL_STATE_ADD_REQUESTED);
+	atomic_store(&((registry_impl_t *)registry->impl)->sync_requested, true);
 	agent->conn_impl = conn_impl;
-	++((registry_impl_t *)registry->impl)->generation;
 	return 0;
 }
 
 void conn_poll_cleanup(juice_agent_t *agent) {
 	conn_impl_t *conn_impl = agent->conn_impl;
-	++((registry_impl_t *)conn_impl->registry->impl)->generation;
+	conn_registry_t *registry = conn_impl->registry;
 
-	conn_poll_interrupt(agent);
+	atomic_store(&conn_impl->poll_state, POLL_STATE_REMOVE_REQUESTED);
+	atomic_store(&((registry_impl_t *)registry->impl)->sync_requested, true);
+	conn_poll_wake(registry->impl);
+
+	mutex_unlock(&registry->mutex);
+	while (atomic_load(&conn_impl->poll_state) != POLL_STATE_RELEASED &&
+	       !atomic_load(&((registry_impl_t *)registry->impl)->exited))
+		conn_poll_sleep_ms(1);
+	mutex_lock(&registry->mutex);
 
 	mutex_destroy(&conn_impl->send_mutex);
+	mutex_destroy(&conn_impl->agent_mutex);
 	closesocket(conn_impl->udp_sock);
 	for (int k = 0; k < CONN_MAX_TCP; ++k) {
 		tcp_conn_t *tc = conn_impl->tcp[k];
@@ -657,42 +780,18 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 
 void conn_poll_lock(juice_agent_t *agent) {
 	conn_impl_t *conn_impl = agent->conn_impl;
-	conn_registry_t *registry = conn_impl->registry;
-	mutex_lock(&registry->mutex);
+	mutex_lock(&conn_impl->agent_mutex);
 }
 
 void conn_poll_unlock(juice_agent_t *agent) {
 	conn_impl_t *conn_impl = agent->conn_impl;
-	conn_registry_t *registry = conn_impl->registry;
-	mutex_unlock(&registry->mutex);
+	mutex_unlock(&conn_impl->agent_mutex);
 }
 
 int conn_poll_interrupt(juice_agent_t *agent) {
 	conn_impl_t *conn_impl = agent->conn_impl;
-	conn_registry_t *registry = conn_impl->registry;
-	registry_impl_t *registry_impl = registry->impl;
-
-	mutex_lock(&registry->mutex);
-	conn_impl->next_timestamp = current_timestamp();
-	mutex_unlock(&registry->mutex);
-
-	JLOG_VERBOSE("Interrupting connections thread");
-
-	char dummy = 0;
-#ifdef _WIN32
-	if (udp_sendto_self(registry_impl->interrupt_sock, &dummy, 0) < 0) {
-		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
-			JLOG_WARN("Failed to interrupt poll by triggering socket, errno=%d", sockerrno);
-		}
-		return -1;
-	}
-#else
-	if (write(registry_impl->interrupt_pipe_out, &dummy, 1) < 0 && errno != EAGAIN &&
-	    errno != EWOULDBLOCK) {
-		JLOG_WARN("Failed to interrupt poll by writing to pipe, errno=%d", errno);
-	}
-#endif
-	return 0;
+	atomic_store(&conn_impl->wake, true);
+	return conn_poll_wake(conn_impl->registry->impl);
 }
 
 int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
@@ -750,7 +849,6 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 	}
 
 	mutex_unlock(&conn_impl->send_mutex);
-	// Interrupt takes the registry mutex: release send_mutex first to preserve lock order.
 	if (interrupt_POLLOUT)
 		conn_poll_interrupt(agent);
 	return ret;
@@ -758,21 +856,21 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 
 void conn_poll_tcp_close(juice_agent_t *agent, const addr_record_t *dst) {
 	conn_impl_t *conn_impl = agent->conn_impl;
-	mutex_lock(&conn_impl->registry->mutex);
+	mutex_lock(&conn_impl->agent_mutex);
 	tcp_conn_t *tc = conn_poll_find_tcp(conn_impl, dst);
 	if (tc && tc->sock != INVALID_SOCKET) {
 		conn_poll_close_tcp(conn_impl, tc);
 		// Rebuild the poll snapshot and run bookkeeping for a possible redirect retry.
 		conn_poll_interrupt(agent);
 	}
-	mutex_unlock(&conn_impl->registry->mutex);
+	mutex_unlock(&conn_impl->agent_mutex);
 }
 
 void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_framing_t framing,
                            const char *tls_hostname, bool tls_insecure_skip_verify) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 
-	mutex_lock(&conn_impl->registry->mutex);
+	mutex_lock(&conn_impl->agent_mutex);
 	mutex_lock(&conn_impl->send_mutex);
 
 	tcp_conn_t *tc = conn_poll_find_tcp(conn_impl, dst);
@@ -846,7 +944,7 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_f
 		} else {
 			memcpy(&tc->dst, dst, sizeof(tc->dst));
 			tc->connect_deadline = current_timestamp() + TCP_CONNECT_TIMEOUT;
-			++((registry_impl_t *)conn_impl->registry->impl)->generation;
+			((registry_impl_t *)conn_impl->registry->impl)->sockets_changed = true;
 			connecting = tc;
 		}
 	}
@@ -856,7 +954,7 @@ done:
 	// Calls back into agent code: must not run under send_mutex
 	if (connecting)
 		conn_poll_change_tcp_state(agent, connecting, TCP_STATE_CONNECTING);
-	mutex_unlock(&conn_impl->registry->mutex);
+	mutex_unlock(&conn_impl->agent_mutex);
 }
 
 int conn_poll_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {

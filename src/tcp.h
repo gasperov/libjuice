@@ -95,6 +95,7 @@ typedef struct tcp_conn {
 	tcp_state_t state;
 	tls_client_t *tls; // NULL unless framing == TCP_FRAMING_STUN_TLS
 	timestamp_t connect_deadline; // valid while state is CONNECTING or TLS_HANDSHAKING
+	bool read_pending;
 } tcp_conn_t;
 
 const char *tcp_state_to_string(tcp_state_t state);
