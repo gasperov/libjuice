@@ -521,7 +521,7 @@ int agent_resolve_servers(juice_agent_t *agent) {
 		                           false, NULL);
 		agent_resolve_turn_servers(agent, agent->turn_servers_tcp,
 		                           agent->turn_servers_tcp_count, SOCK_STREAM, &count,
-		                           MAX_RELAY_ENTRIES_COUNT, fallback_delay, false, NULL);
+		                           MAX_RELAY_ENTRIES_COUNT - tls_reserved, fallback_delay, false, NULL);
 		agent_resolve_turn_servers(agent, agent->turn_servers_tls,
 		                           agent->turn_servers_tls_count, SOCK_STREAM, &count,
 		                           MAX_RELAY_ENTRIES_COUNT, fallback_delay, true,
@@ -2045,16 +2045,20 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 
 		{
 			// A relay of a given transport tier succeeding means any pending relay entry in a
-			// strictly worse tier (UDP < TURN-TCP < TURNS) that has not started connecting yet
-			// can be cancelled; entries in an equal or better tier are left to keep trying.
+			// strictly worse tier (UDP < TURN-TCP < TURNS) that has not allocated yet can be
+			// cancelled, closing its connection if it was already connecting; entries in an equal
+			// or better tier are left to keep trying.
 			int rank = relay_entry_rank(entry);
 			for (int i = 0; i < agent->entries_count; ++i) {
 				agent_stun_entry_t *other_entry = agent->entries + i;
 				if (other_entry->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
 				    relay_entry_rank(other_entry) > rank &&
-				    other_entry->state == AGENT_STUN_ENTRY_STATE_PENDING &&
-				    other_entry->tcp_state == TCP_STATE_DISCONNECTED) {
+				    other_entry->state == AGENT_STUN_ENTRY_STATE_PENDING) {
 					JLOG_DEBUG("STUN entry %d: Cancelled worse-tier TURN entry after a better relay succeeded", i);
+					if (entry_is_tcp(other_entry) && other_entry->tcp_state != TCP_STATE_DISCONNECTED) {
+						conn_tcp_close(agent, &other_entry->record);
+						other_entry->tcp_state = TCP_STATE_DISCONNECTED;
+					}
 					other_entry->state = AGENT_STUN_ENTRY_STATE_CANCELLED;
 					other_entry->next_transmission = 0;
 				}
