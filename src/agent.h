@@ -33,8 +33,9 @@
 // characteristics of the associated data.
 #define STUN_PACING_TIME 50 // msecs
 
-// non-rfc: delay turn tcp startup
-#define TURN_TCP_DELAY_START 1000
+// non-rfc: delay turn tcp startup when UDP TURN servers are configured, so a UDP allocation
+// gets to succeed first even after two lost packets (STUN retransmissions at 500 and 1500 ms)
+#define TURN_TCP_DELAY_START 3000
 // non-rfc: backstop above tcp.h's TCP_CONNECT_TIMEOUT, which normally fails the connection first
 #define AGENT_TCP_CONNECT_TIMEOUT 10000 // msecs
 // ice_compute_priority() uses at most 13 local-preference bits for a UDP relay candidate.
@@ -70,7 +71,7 @@
 
 // Max STUN and TURN server entries
 #define MAX_SERVER_ENTRIES_COUNT 2 // max STUN server entries
-#define MAX_RELAY_ENTRIES_COUNT 2  // max TURN server entries
+#define MAX_RELAY_ENTRIES_COUNT JUICE_MAX_TURN_SERVERS_COUNT // max TURN server entries
 
 // Max TURN redirections for ALTERNATE-SERVER mechanism
 #define MAX_TURN_REDIRECTIONS 1

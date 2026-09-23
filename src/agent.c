@@ -506,13 +506,13 @@ int agent_resolve_servers(juice_agent_t *agent) {
 
 		// Relay entries are capped at MAX_RELAY_ENTRIES_COUNT total (shared across UDP, TCP and
 		// TLS servers, since that bound also sizes MAX_CANDIDATE_PAIRS_COUNT). Reserve one slot
-		// for TCP/TLS whenever either is configured, so it doesn't get starved out entirely by a
-		// full complement of UDP servers; if both TCP and TLS servers are configured alongside
-		// UDP, only one of them (TCP, resolved first below) is guaranteed that reserved slot.
-		bool has_tcp_or_tls = agent->turn_servers_tcp_count > 0 || agent->turn_servers_tls_count > 0;
-		int udp_max = MAX_RELAY_ENTRIES_COUNT;
-		if (has_tcp_or_tls && udp_max > 0)
-			--udp_max;
+		// for each configured stream transport, so neither TCP nor TLS gets starved out by a
+		// full complement of UDP servers.
+		int tcp_reserved = agent->turn_servers_tcp_count > 0 ? 1 : 0;
+		int tls_reserved = agent->turn_servers_tls_count > 0 ? 1 : 0;
+		int udp_max = MAX_RELAY_ENTRIES_COUNT - tcp_reserved - tls_reserved;
+		if (udp_max < 0)
+			udp_max = 0;
 
 		timediff_t fallback_delay = agent->config.turn_servers_count > 0 ? TURN_TCP_DELAY_START : 0;
 
