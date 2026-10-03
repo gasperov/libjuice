@@ -63,6 +63,7 @@ static inline void thread_join_impl(thread_t t, thread_return_t *res) {
 #define thread_init(t, func, arg)                                                                  \
 	((*(t) = CreateThread(NULL, 0, func, arg, 0, NULL)) != NULL ? 0 : (int)GetLastError())
 #define thread_join(t, res) thread_join_impl(t, res)
+#define thread_is_self(t) (GetThreadId(t) == GetCurrentThreadId())
 
 #else // POSIX
 
@@ -101,6 +102,7 @@ static inline int mutex_init_impl(mutex_t *m, int flags) {
 
 #define thread_init(t, func, arg) pthread_create(t, NULL, func, arg)
 #define thread_join(t, res) (void)pthread_join(t, res)
+#define thread_is_self(t) pthread_equal(t, pthread_self())
 
 #endif // ifdef _WIN32
 
