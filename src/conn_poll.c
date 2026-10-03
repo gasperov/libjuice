@@ -218,6 +218,8 @@ static int conn_poll_sync_agents(conn_registry_t *registry, registry_impl_t *reg
 	int count = 0;
 	for (int i = 0; i < registry_impl->poll_agents_count; ++i) {
 		juice_agent_t *agent = registry_impl->poll_agents[i];
+		if (!agent)
+			continue;
 		conn_impl_t *conn_impl = agent->conn_impl;
 		if (atomic_load(&conn_impl->poll_state) == POLL_STATE_REMOVE_REQUESTED)
 			atomic_store(&conn_impl->poll_state, POLL_STATE_RELEASED);
@@ -278,6 +280,8 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 	nfds_t size = 1;
 	for (int i = 0; i < registry_impl->poll_agents_count; ++i) {
 		juice_agent_t *agent = registry_impl->poll_agents[i];
+		if (!agent)
+			continue;
 		conn_impl_t *conn_impl = agent->conn_impl;
 		if (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY) {
 			continue;
@@ -326,6 +330,8 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 	nfds_t i = 1;
 	for (int j = 0; j < registry_impl->poll_agents_count; ++j) {
 		juice_agent_t *agent = registry_impl->poll_agents[j];
+		if (!agent)
+			continue;
 		conn_impl_t *conn_impl = agent->conn_impl;
 		if (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)
 			continue;
@@ -376,7 +382,8 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 	}
 
 	registry_impl->sockets_changed = false;
-	return size - 1;
+	pfds->size = i;
+	return (int)i - 1;
 }
 
 void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
@@ -639,6 +646,8 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 	nfds_t i = 1;
 	for (int j = 0; j < registry_impl->poll_agents_count; ++j) {
 		juice_agent_t *agent = registry_impl->poll_agents[j];
+		if (!agent)
+			continue;
 		conn_impl_t *conn_impl = agent->conn_impl;
 		if (conn_impl->state != CONN_STATE_NEW && conn_impl->state != CONN_STATE_READY)
 			continue;
@@ -750,16 +759,25 @@ int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 void conn_poll_cleanup(juice_agent_t *agent) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 	conn_registry_t *registry = conn_impl->registry;
+	registry_impl_t *registry_impl = registry->impl;
 
-	atomic_store(&conn_impl->poll_state, POLL_STATE_REMOVE_REQUESTED);
-	atomic_store(&((registry_impl_t *)registry->impl)->sync_requested, true);
-	conn_poll_wake(registry->impl);
+	if (thread_is_self(registry_impl->thread)) {
+		for (int i = 0; i < registry_impl->poll_agents_count; ++i)
+			if (registry_impl->poll_agents[i] == agent)
+				registry_impl->poll_agents[i] = NULL;
+		atomic_store(&conn_impl->poll_state, POLL_STATE_RELEASED);
+		registry_impl->sockets_changed = true;
+	} else {
+		atomic_store(&conn_impl->poll_state, POLL_STATE_REMOVE_REQUESTED);
+		atomic_store(&registry_impl->sync_requested, true);
+		conn_poll_wake(registry_impl);
 
-	mutex_unlock(&registry->mutex);
-	while (atomic_load(&conn_impl->poll_state) != POLL_STATE_RELEASED &&
-	       !atomic_load(&((registry_impl_t *)registry->impl)->exited))
-		conn_poll_sleep_ms(1);
-	mutex_lock(&registry->mutex);
+		mutex_unlock(&registry->mutex);
+		while (atomic_load(&conn_impl->poll_state) != POLL_STATE_RELEASED &&
+		       !atomic_load(&registry_impl->exited))
+			conn_poll_sleep_ms(1);
+		mutex_lock(&registry->mutex);
+	}
 
 	mutex_destroy(&conn_impl->send_mutex);
 	mutex_destroy(&conn_impl->agent_mutex);
