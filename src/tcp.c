@@ -158,12 +158,7 @@ int tcp_ice_read(socket_t sock, tcp_read_context_t *context) {
 
 	context->pending = false;
 	assert(context->length > 0);
-
-	uint32_t length = context->length;
-	if (length > TCP_BUFFER_SIZE)
-		length = TCP_BUFFER_SIZE;
-
-	return (int)length;
+	return (int)(context->length > TCP_BUFFER_SIZE ? TCP_BUFFER_SIZE : context->length);
 }
 
 // Write raw STUN or ChannelData message to TCP socket (no RFC 4571 framing).
