@@ -509,6 +509,8 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 	}
 
 	if (tc->state == TCP_STATE_TLS_HANDSHAKING) {
+		if (!(pfd->revents & (POLLIN | POLLOUT)))
+			return;
 		int ret = tls_client_handshake(tc->tls, tc->sock);
 		if (ret < 0) {
 			JLOG_INFO("%s handshake failed", label);
