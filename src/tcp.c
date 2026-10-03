@@ -248,14 +248,15 @@ static int tcp_stun_tls_recv(tls_client_t *tls, socket_t sock, char *dst, uint32
 			int ret = tls_decode(tls, cs->buf + cs->off, cs->len, &pt, &pt_len, &consumed);
 			if (ret < 0)
 				return -SECONNRESET;
+			if (ret == 2)
+				return 0; // peer's close_notify
 			if (ret == 1) {
 				size_t extra = cs->len - consumed;
-				if (pt_len == 0 && extra == 0)
-					return 0; // peer's close_notify: reported as a valid, empty record
 				// pt already points within buf (decryption happens in place); extra, if any, is
 				// the tail of the same input region, so advancing off past what was consumed
 				// lines it up without moving anything.
-				cs->plain_off = (uint32_t)(pt - cs->buf);
+				if (pt_len > 0)
+					cs->plain_off = (uint32_t)(pt - cs->buf);
 				cs->plain_len = (uint32_t)pt_len;
 				cs->off += (uint32_t)consumed;
 				cs->len = (uint32_t)extra;
