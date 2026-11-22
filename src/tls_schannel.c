@@ -50,11 +50,9 @@ struct tls_client {
 
 	tls_cipher_state_t cipher;
 
-	// Handshake-only: an outgoing token from InitializeSecurityContextW not yet fully sent.
-	// Since a fresh call generates a different token, a partial send (EWOULDBLOCK on the
-	// non-blocking socket) must resume from here, not regenerate the token. out_final records
-	// whether the status that produced this token was SEC_E_OK, so tls_client_handshake() knows
-	// what finishing this flush means without needing that status to still be in scope.
+	// Handshake token not fully sent yet. A blocked send resumes here, since calling
+	// InitializeSecurityContextW again would produce a different token. out_final is set when it
+	// is the last one (status SEC_E_OK).
 	char *out_buf; // SChannel-allocated (FreeContextBuffer), NULL if nothing pending
 	size_t out_off;
 	size_t out_len;
@@ -101,24 +99,22 @@ bool tls_client_wants_write(const tls_client_t *tls) {
 	return tls->out_buf != NULL;
 }
 
-// Sends buf[*off..len), advancing *off as bytes go out. Returns 1 once *off reaches len, 0 if
-// the non-blocking socket's send buffer is full (progress so far already recorded in *off, so a
-// later call with the same buf/len/off resumes correctly), or -1 on fatal error. No allocation.
-static int tls_socket_send(void *user_ptr, const char *buf, size_t len) {
-	socket_t sock = *(socket_t *)user_ptr;
-	int n = send(sock, buf, (int)len, 0);
-	return n < 0 ? -sockerrno : n;
-}
-
+// Sends buf[*off..len), advancing *off. Returns 1 once done, 0 if the socket would block (call
+// again with the same arguments), or -1 on error.
 static int tls_send_partial(socket_t sock, const char *buf, size_t len, size_t *off) {
-	return tls_send_partial_with(tls_socket_send, &sock, buf, len, off);
+	while (*off < len) {
+		int n = send(sock, buf + *off, (int)(len - *off), 0);
+		if (n < 0)
+			return sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK ? 0 : -1;
+		if (n == 0)
+			return -1;
+		*off += (size_t)n;
+	}
+	return 1;
 }
 
-// Resumes/starts flushing tls->out_buf (if any) to sock. Returns 1 once fully flushed (freeing
-// the SChannel-allocated buffer), 0 if it would still block (the caller returns to
-// tls_client_handshake() on the next poll() readiness event, which resumes here rather than
-// calling InitializeSecurityContextW again and generating a different token), or -1 on fatal
-// error (also frees the buffer).
+// Sends the pending handshake token, if any, and frees it once sent or on error. Returns like
+// tls_send_partial().
 static int tls_flush_pending_output(tls_client_t *tls, socket_t sock) {
 	if (!tls->out_buf)
 		return 1;
@@ -160,9 +156,7 @@ int tls_client_handshake(tls_client_t *tls, socket_t sock) {
 		tls->cred_valid = true;
 	}
 
-	// Resume a still-pending outgoing token from a previous call before generating or processing
-	// anything else. The state-machine bookkeeping (cipher.len, out_final) for it was already
-	// recorded when the token was generated, below, so finishing the flush is all that's left.
+	// Finish sending a token left over from the previous call first
 	if (tls->out_buf) {
 		int flushed = tls_flush_pending_output(tls, sock);
 		if (flushed < 0)
@@ -178,16 +172,13 @@ int tls_client_handshake(tls_client_t *tls, socket_t sock) {
 			tls->handshake_done = true;
 			return 1;
 		}
-		// Otherwise fall through: cipher.len already reflects this token's EXTRA/consumed
-		// bookkeeping, so the loop below just continues the handshake from there.
+		// Otherwise continue the handshake below
 	}
 
 	const DWORD flags_in = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT |
 	                       ISC_REQ_CONFIDENTIALITY | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM;
 
-	// Reuses the data-phase cipher buffer to accumulate handshake tokens: the two phases never
-	// overlap, and any bytes left over after the final handshake message are the start of the
-	// first application-data record, which the data phase needs in this same buffer anyway.
+	// Received handshake messages accumulate in tls->cipher, where the data phase continues
 	for (;;) {
 		SecBuffer in_buffers[2];
 		in_buffers[0].BufferType = SECBUFFER_TOKEN;
@@ -211,11 +202,9 @@ int tls_client_handshake(tls_client_t *tls, socket_t sock) {
 		    &flags_out, NULL);
 		tls->ctx_valid = true;
 
-		// Record what this call consumed/left over before attempting to send anything below, so
-		// a blocked send doesn't leave this call's progress unaccounted for on the next resume.
+		// Keep unconsumed bytes (the next message, or application data after the last one) before
+		// sending anything, so a blocked send loses nothing
 		if (status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED) {
-			// Bytes past the consumed handshake token belong to the next token (or, on the
-			// final call, to the start of the application data stream) and must be kept.
 			if (in_buffers[1].BufferType == SECBUFFER_EXTRA) {
 				memmove(tls->cipher.buf, tls->cipher.buf + (tls->cipher.len - in_buffers[1].cbBuffer),
 				        in_buffers[1].cbBuffer);
@@ -225,8 +214,7 @@ int tls_client_handshake(tls_client_t *tls, socket_t sock) {
 			}
 		}
 
-		// Attempt to send any token unconditionally (even alongside a failure status below, e.g.
-		// a final alert) before deciding what the status means.
+		// Send any token, even with a failure status (e.g. an alert), before handling the status
 		if (out_buffers[0].cbBuffer && out_buffers[0].pvBuffer) {
 			tls->out_buf = (char *)out_buffers[0].pvBuffer;
 			tls->out_off = 0;

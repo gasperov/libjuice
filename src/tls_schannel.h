@@ -15,9 +15,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Declared unconditionally (opaque) so callers can hold a tls_client_t* on any platform without
-// preprocessor conditionals; only tls_client_create() can produce a non-NULL one, and it only
-// exists when SChannel support is actually compiled in.
+// Opaque on every platform; only non-NULL when created with SChannel support
 typedef struct tls_client tls_client_t;
 
 #if defined(_WIN32) && defined(USE_SCHANNEL)
@@ -38,35 +36,16 @@ int tls_encode(tls_client_t *tls, char *buf, size_t buf_capacity, size_t plain_s
 // cap), 0 once the peer closed, or a negative error (-SEAGAIN when nothing is available yet).
 int tls_client_recv(tls_client_t *tls, socket_t sock, char *dst, size_t cap);
 
-// True while a partially-sent handshake token is pending flush, i.e. the handshake needs the
-// socket to become writable; otherwise it is waiting to read the server's next flight.
+// True while the handshake waits to finish sending, so it needs the socket to become writable
 bool tls_client_wants_write(const tls_client_t *tls);
 
-// Internal adapter returns bytes sent or a negative socket error. Passing it per call lets
-// tests exercise the production flush loop without relying on OS buffer sizes or timing.
-typedef int (*tls_send_func_t)(void *user_ptr, const char *buf, size_t len);
-static inline int tls_send_partial_with(tls_send_func_t send_func, void *user_ptr,
-                                        const char *buf, size_t len, size_t *off) {
-	while (*off < len) {
-		int n = send_func(user_ptr, buf + *off, len - *off);
-		if (n == -SEAGAIN || n == -SEWOULDBLOCK)
-			return 0;
-		if (n <= 0)
-			return -1;
-		*off += (size_t)n;
-	}
-	return 1;
-}
-
-// Export for tests. Sends buf[*off..len), advancing *off as bytes go out. Returns 1 once *off
-// reaches len, 0 if the socket would still block (progress so far already recorded in *off, so
-// a later call with the same buf/len/off resumes correctly), <0 on fatal error. No allocation.
+// Export for tests: sends buf[*off..len), advancing *off. Returns 1 once done, 0 if the socket
+// would block (call again with the same arguments), or -1 on error.
 JUICE_EXPORT int _juice_tls_send_partial(socket_t sock, const char *buf, size_t len, size_t *off);
 
 #else
 
-// Unreachable in practice: with no tls_client_create() on this build, tls is always NULL and
-// callers branch on that before reaching these. Stubs exist so call sites don't need #ifdef.
+// Without SChannel tls is always NULL, so these are never reached; they spare call sites #ifdefs
 static inline int tls_client_handshake(tls_client_t *tls, socket_t sock) {
 	(void)tls; (void)sock;
 	return -1;

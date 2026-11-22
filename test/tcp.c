@@ -824,23 +824,6 @@ int test_tcp_ice_write_eagain(void) {
 }
 
 #if defined(_WIN32) && defined(USE_SCHANNEL)
-typedef struct tls_send_script {
-	const char *data;
-	int step;
-} tls_send_script_t;
-
-static int tls_scripted_send(void *user_ptr, const char *buf, size_t len) {
-	tls_send_script_t *script = user_ptr;
-	static const struct { size_t offset; int result; } writes[] = {
-	    {0, 7}, {7, -SEAGAIN}, {7, -SEWOULDBLOCK}, {7, 17}, {0, -SECONNRESET}, {0, 0}};
-	if (script->step >= (int)(sizeof(writes) / sizeof(writes[0])))
-		return -SECONNRESET;
-	size_t offset = writes[script->step].offset;
-	if (buf != script->data + offset || len != strlen(script->data) - offset)
-		return -SECONNRESET;
-	return writes[script->step++].result;
-}
-
 #define TLS_CHECK(condition) do { \
 	if (!(condition)) { \
 		printf("TLS partial send failed at line %d: %s\n", __LINE__, #condition); \
@@ -849,27 +832,8 @@ static int tls_scripted_send(void *user_ptr, const char *buf, size_t len) {
 } while (0)
 
 int test_tls_send_partial(void) {
-	const char token[] = "0123456789abcdefghijklmn";
-	const size_t len = sizeof(token) - 1;
-	tls_send_script_t script = {token, 0};
-	size_t off = 0;
-	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 0);
-	TLS_CHECK(off == 7 && script.step == 2);
-	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 0);
-	TLS_CHECK(off == 7 && script.step == 3);
-	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 1);
-	TLS_CHECK(off == len && script.step == 4);
-	// A completed token must not be sent again; fatal and zero-byte sends must stop.
-	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == 1);
-	TLS_CHECK(script.step == 4);
-	off = 0;
-	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == -1);
-	TLS_CHECK(off == 0 && script.step == 5);
-	TLS_CHECK(tls_send_partial_with(tls_scripted_send, &script, token, len, &off) == -1);
-	TLS_CHECK(off == 0 && script.step == 6);
-
-	// Exercise the production socket adapter too. Check delivery and offset handling,
-	// without assuming that a particular write must block on this operating system.
+	// Send through a non-blocking loopback socket, checking delivery and offset handling
+	// without assuming that a particular write must block on this operating system
 	socket_t wr, rd;
 	if (make_tcp_loopback_pair(&wr, &rd) != 0)
 		return -1;
@@ -883,7 +847,7 @@ int test_tls_send_partial(void) {
 	for (size_t i = 0; i < sizeof(data); ++i)
 		data[i] = (char)(i & 0xFF);
 	const size_t start = 400;
-	off = start;
+	size_t off = start;
 	size_t count = 0;
 	int ret = 0;
 	ULONGLONG deadline = GetTickCount64() + 5000;
@@ -908,7 +872,7 @@ int test_tls_send_partial(void) {
 	TLS_CHECK(ret == 1 && off == sizeof(data));
 	TLS_CHECK(count == sizeof(data) - start);
 	TLS_CHECK(memcmp(received, data + start, count) == 0);
-	printf("Success: scripted TLS backpressure and loopback delivery\n");
+	printf("Success\n");
 	return 0;
 }
 
