@@ -46,9 +46,12 @@ typedef enum poll_state {
 	POLL_STATE_RELEASED
 } poll_state_t;
 
-// One generic TCP connection per ICE-TCP candidate plus one per TURN TCP relay. The connection to
-// use for a given destination is found by address; the only per-connection difference is framing.
-#define CONN_MAX_TCP (1 + MAX_RELAY_ENTRIES_COUNT)
+// TCP connection slots, found by destination address: TURN-TCP/TURNS relays first, then ICE-TCP
+// checks, so neither can run the other out. Relay entries never exceed MAX_RELAY_ENTRIES_COUNT.
+// Slots are allocated on first use.
+#define CONN_RELAY_TCP_SLOTS MAX_RELAY_ENTRIES_COUNT
+#define CONN_ICE_TCP_SLOTS 4
+#define CONN_MAX_TCP (CONN_RELAY_TCP_SLOTS + CONN_ICE_TCP_SLOTS)
 
 typedef struct conn_impl {
 	conn_registry_t *registry;
@@ -188,12 +191,12 @@ void conn_poll_registry_cleanup(conn_registry_t *registry) {
 	registry->impl = NULL;
 }
 
+// The open connection to dst, if any
 static tcp_conn_t *conn_poll_find_tcp(conn_impl_t *conn_impl, const addr_record_t *dst) {
 	for (int k = 0; k < CONN_MAX_TCP; ++k) {
 		tcp_conn_t *tc = conn_impl->tcp[k];
-		if (tc && addr_record_is_equal(&tc->dst, dst, true)) {
+		if (tc && tc->sock != INVALID_SOCKET && addr_record_is_equal(&tc->dst, dst, true))
 			return tc;
-		}
 	}
 	return NULL;
 }
@@ -867,7 +870,7 @@ void conn_poll_tcp_close(juice_agent_t *agent, const addr_record_t *dst) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 	mutex_lock(&conn_impl->agent_mutex);
 	tcp_conn_t *tc = conn_poll_find_tcp(conn_impl, dst);
-	if (tc && tc->sock != INVALID_SOCKET) {
+	if (tc) {
 		conn_poll_close_tcp(conn_impl, tc);
 		// Rebuild the poll snapshot and run bookkeeping for a possible redirect retry.
 		conn_poll_interrupt(agent);
@@ -882,49 +885,33 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_f
 	mutex_lock(&conn_impl->agent_mutex);
 	mutex_lock(&conn_impl->send_mutex);
 
-	tcp_conn_t *tc = conn_poll_find_tcp(conn_impl, dst);
 	tcp_conn_t *connecting = NULL;
-	int k = -1;
-	if (tc) {
-		if (tc->sock != INVALID_SOCKET)
-			goto done; // a connection to this destination already exists
+	tcp_conn_t *tc = NULL;
+	if (conn_poll_find_tcp(conn_impl, dst))
+		goto done; // already connected or connecting
 
-		// Reuse the slot of a previously closed connection to the same destination
-		for (k = 0; k < CONN_MAX_TCP; ++k) {
-			if (conn_impl->tcp[k] == tc) break;
-		}
-		tcp_conn_reset(tc);
-		tcp_conn_init(tc, framing);
-	} else {
-		for (k = 0; k < CONN_MAX_TCP; ++k) {
-			if (!conn_impl->tcp[k])
-				break;
-		}
-		if (k == CONN_MAX_TCP) {
-			// No unused slot: reclaim a closed one
-			for (k = 0; k < CONN_MAX_TCP; ++k) {
-				if (conn_impl->tcp[k]->sock == INVALID_SOCKET)
-					break;
-			}
-		}
-		if (k == CONN_MAX_TCP) {
-			JLOG_WARN("No free TCP connection slot available");
+	int begin = framing == TCP_FRAMING_ICE ? CONN_RELAY_TCP_SLOTS : 0;
+	int end = framing == TCP_FRAMING_ICE ? CONN_MAX_TCP : CONN_RELAY_TCP_SLOTS;
+	int k = begin;
+	while (k < end && conn_impl->tcp[k] && conn_impl->tcp[k]->sock != INVALID_SOCKET)
+		++k; // first unused or closed slot
+	if (k == end) {
+		JLOG_WARN("No free %s connection slot available", tcp_framing_to_string(framing));
+		goto done;
+	}
+
+	tc = conn_impl->tcp[k];
+	if (!tc) {
+		tc = calloc(1, sizeof(tcp_conn_t));
+		if (!tc) {
+			JLOG_ERROR("Memory allocation for TCP connection failed");
 			goto done;
 		}
-
-		tc = conn_impl->tcp[k];
-		if (!tc) {
-			tc = calloc(1, sizeof(tcp_conn_t));
-			if (!tc) {
-				JLOG_ERROR("Memory allocation for TCP connection failed");
-				goto done;
-			}
-			conn_impl->tcp[k] = tc;
-		} else {
-			tcp_conn_reset(tc);
-		}
-		tcp_conn_init(tc, framing);
+		conn_impl->tcp[k] = tc;
+	} else {
+		tcp_conn_reset(tc);
 	}
+	tcp_conn_init(tc, framing);
 
 	if (framing == TCP_FRAMING_STUN_TLS) {
 #if defined(_WIN32) && defined(USE_SCHANNEL)
