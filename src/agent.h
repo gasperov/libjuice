@@ -170,6 +170,7 @@ struct juice_agent {
 	conn_registry_t *registry;
 	int conn_index;
 	void *conn_impl;
+	int conn_depth;
 
 	thread_t resolver_thread;
 	bool resolver_thread_started;

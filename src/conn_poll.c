@@ -416,8 +416,6 @@ void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
 				conn_impl->state = CONN_STATE_FINISHED;
 				break;
 			}
-			if (conn_impl->state == CONN_STATE_FINISHED)
-				break;
 		}
 
 		if (conn_impl->state == CONN_STATE_FINISHED)
@@ -559,8 +557,6 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 				conn_impl->state = CONN_STATE_FINISHED;
 				break;
 			}
-			if (conn_impl->state == CONN_STATE_FINISHED)
-				break;
 			// A callback can close/reuse this slot; a replacement must connect first.
 			if (tc->state != TCP_STATE_CONNECTED)
 				return;
@@ -676,7 +672,7 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 		bool stale = registry_impl->sockets_changed;
 		i++;
 
-		for (int k = 0; !stale && conn_impl->state != CONN_STATE_FINISHED && k < CONN_MAX_TCP; ++k) {
+		for (int k = 0; !stale && k < CONN_MAX_TCP; ++k) {
 			tcp_conn_t *tc = conn_impl->tcp[k];
 			if (!tc || tc->sock == INVALID_SOCKET)
 				continue;
@@ -800,31 +796,6 @@ void conn_poll_cleanup(juice_agent_t *agent) {
 	}
 	free(agent->conn_impl);
 	agent->conn_impl = NULL;
-}
-
-static thread_return_t THREAD_CALL conn_poll_destroy_entry(void *arg) {
-	thread_set_name_self("juice destroy");
-	agent_destroy((juice_agent_t *)arg);
-	return (thread_return_t)0;
-}
-
-bool conn_poll_defer_destroy(juice_agent_t *agent) {
-	conn_impl_t *conn_impl = agent->conn_impl;
-	registry_impl_t *registry_impl = conn_impl->registry->impl;
-	if (!thread_is_self(registry_impl->thread))
-		return false;
-
-	JLOG_DEBUG("Deferring agent destruction off the connections thread");
-	conn_impl->state = CONN_STATE_FINISHED;
-
-	thread_t thread;
-	int ret = thread_init(&thread, conn_poll_destroy_entry, agent);
-	if (ret) {
-		JLOG_ERROR("Destroy thread creation failed, error=%d, leaking agent", ret);
-		return true;
-	}
-	thread_detach(thread);
-	return true;
 }
 
 void conn_poll_lock(juice_agent_t *agent) {

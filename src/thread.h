@@ -64,7 +64,7 @@ static inline void thread_join_impl(thread_t t, thread_return_t *res) {
 	((*(t) = CreateThread(NULL, 0, func, arg, 0, NULL)) != NULL ? 0 : (int)GetLastError())
 #define thread_join(t, res) thread_join_impl(t, res)
 #define thread_is_self(t) (GetThreadId(t) == GetCurrentThreadId())
-#define thread_detach(t) CloseHandle(t)
+#define thread_detach(t) (void)CloseHandle(t)
 
 #else // POSIX
 

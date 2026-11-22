@@ -9,7 +9,6 @@
 #include "juice.h"
 #include "addr.h"
 #include "agent.h"
-#include "conn.h"
 #include "ice.h"
 
 #ifndef NO_SERVER
@@ -27,7 +26,7 @@ JUICE_EXPORT juice_agent_t *juice_create(const juice_config_t *config) {
 }
 
 JUICE_EXPORT void juice_destroy(juice_agent_t *agent) {
-	if (agent && !conn_defer_destroy(agent))
+	if (agent)
 		agent_destroy(agent);
 }
 

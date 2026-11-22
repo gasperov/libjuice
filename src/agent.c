@@ -170,7 +170,42 @@ error:
 	return NULL;
 }
 
+static thread_return_t THREAD_CALL agent_destroy_thread_entry(void *arg) {
+	thread_set_name_self("juice destroy");
+	agent_destroy((juice_agent_t *)arg);
+	return (thread_return_t)0;
+}
+
+static bool agent_defer_destroy(juice_agent_t *agent) {
+	conn_lock(agent);
+	bool deferred = agent->conn_depth > 0;
+	if (deferred) {
+		// No user callback may run once juice_destroy() has returned
+		agent->config.cb_state_changed = NULL;
+		agent->config.cb_candidate = NULL;
+		agent->config.cb_gathering_done = NULL;
+		agent->config.cb_recv = NULL;
+	}
+	conn_unlock(agent);
+
+	if (!deferred)
+		return false;
+
+	JLOG_DEBUG("Called from a callback, deferring agent destruction to a separate thread");
+	thread_t thread;
+	int ret = thread_init(&thread, agent_destroy_thread_entry, agent);
+	if (ret) {
+		JLOG_ERROR("Destroy thread creation failed, error=%d, leaking agent", ret);
+		return true;
+	}
+	thread_detach(thread);
+	return true;
+}
+
 void agent_destroy(juice_agent_t *agent) {
+	if (agent_defer_destroy(agent))
+		return;
+
 	JLOG_DEBUG("Destroying agent");
 
 	if (agent->resolver_thread_started) {
@@ -269,8 +304,6 @@ int agent_gather_candidates(juice_agent_t *agent) {
 		agent->mode = AGENT_MODE_CONTROLLING;
 	}
 
-	agent_change_state(agent, JUICE_STATE_GATHERING);
-
 	udp_socket_config_t socket_config;
 	memset(&socket_config, 0, sizeof(socket_config));
 	socket_config.bind_address = agent->config.bind_address;
@@ -293,6 +326,12 @@ int agent_gather_candidates(juice_agent_t *agent) {
 		records_count = ICE_MAX_CANDIDATES_COUNT - 1;
 
 	conn_lock(agent);
+
+	// Callbacks from here on run on the caller's thread: count them like connection callbacks,
+	// so a juice_destroy() from one is deferred until the lock is released at the end
+	++agent->conn_depth;
+
+	agent_change_state(agent, JUICE_STATE_GATHERING);
 
 	JLOG_VERBOSE("Adding %d local host candidates", records_count);
 	for (int i = 0; i < records_count; ++i) {
@@ -361,26 +400,29 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	}
 
 	agent_change_state(agent, JUICE_STATE_CONNECTING);
-	conn_unlock(agent);
-	conn_interrupt(agent);
 
+	int ret;
 	if (has_nonnumeric_server_hostnames(agent)) {
-		// Resolve server hostnames in a separate thread as it may block
+		// Resolve server hostnames in a separate thread as it may block. Starting it under the lock
+		// means a destroy from its callback always finds the thread to join.
 		JLOG_DEBUG("Starting resolver thread for servers");
-		int ret = thread_init(&agent->resolver_thread, resolver_thread_entry, agent);
-		if (ret) {
+		ret = thread_init(&agent->resolver_thread, resolver_thread_entry, agent);
+		if (ret == 0) {
+			agent->resolver_thread_started = true;
+		} else {
 			JLOG_FATAL("Thread creation failed, error=%d", ret);
 			agent_update_gathering_done(agent);
-			return -1;
 		}
-		agent->resolver_thread_started = true;
 	} else {
 		JLOG_DEBUG("Resolving servers synchronously");
-		if (agent_resolve_servers(agent) < 0)
-			return -1;
+		ret = agent_resolve_servers(agent);
 	}
 
-	return 0;
+	--agent->conn_depth;
+	conn_interrupt(agent);
+	// Last use of the agent: a callback above may have destroyed it, which completes once unlocked
+	conn_unlock(agent);
+	return ret ? -1 : 0;
 }
 
 static void agent_resolve_turn_servers(juice_agent_t *agent, juice_turn_server_t *servers, int servers_count,
@@ -573,9 +615,14 @@ int agent_resolve_servers(juice_agent_t *agent) {
 		}
 	}
 
+	// Count the callback like a connection callback, so a juice_destroy() from it is deferred
+	// instead of joining the resolver thread from itself
+	++agent->conn_depth;
 	agent_update_gathering_done(agent);
-	conn_unlock(agent);
+	--agent->conn_depth;
 	conn_interrupt(agent);
+	// Last use of the agent: the callback may have destroyed it, which completes once unlocked
+	conn_unlock(agent);
 	return 0;
 }
 
@@ -926,17 +973,24 @@ int agent_get_selected_candidate_pair(juice_agent_t *agent, ice_candidate_t *loc
 }
 
 int agent_conn_update(juice_agent_t *agent, timestamp_t *next_timestamp) {
-	return agent_bookkeeping(agent, next_timestamp);
+	++agent->conn_depth;
+	int ret = agent_bookkeeping(agent, next_timestamp);
+	--agent->conn_depth;
+	return ret;
 }
 
 int agent_conn_recv(juice_agent_t *agent, char *buf, size_t len, const addr_record_t *src) {
+	++agent->conn_depth;
 	agent_input(agent, buf, len, src, NULL);
+	--agent->conn_depth;
 	return 0; // ignore errors
 }
 
 int agent_conn_fail(juice_agent_t *agent) {
+	++agent->conn_depth;
 	agent_change_state(agent, JUICE_STATE_FAILED);
 	atomic_store(&agent->selected_entry, NULL); // disallow sending
+	--agent->conn_depth;
 	return 0;
 }
 
@@ -1038,7 +1092,8 @@ static void agent_fail_stun_entry(juice_agent_t *agent, agent_stun_entry_t *entr
 		agent_update_gathering_done(agent);
 }
 
-int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_state_t state) {
+static int agent_process_tcp_state(juice_agent_t *agent, const addr_record_t *dst,
+                                   tcp_state_t state) {
 	for (int i = 0; i < agent->entries_count; ++i) {
 		agent_stun_entry_t *entry = agent->entries + i;
 		if (entry_is_tcp(entry) && addr_record_is_equal(&entry->record, dst, true)) {
@@ -1062,6 +1117,13 @@ int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_sta
 
 	JLOG_WARN("No entry found for TCP address");
 	return -1;
+}
+
+int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_state_t state) {
+	++agent->conn_depth;
+	int ret = agent_process_tcp_state(agent, dst, state);
+	--agent->conn_depth;
+	return ret;
 }
 
 int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
