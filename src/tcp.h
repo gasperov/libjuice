@@ -103,6 +103,11 @@ const char *tcp_framing_to_string(tcp_framing_t framing);
 void tcp_conn_init(tcp_conn_t *tc, tcp_framing_t framing);
 void tcp_conn_reset(tcp_conn_t *tc);
 
+// Send a message, or continue a pending one if data is NULL, with the connection's framing
+int tcp_conn_write(tcp_conn_t *tc, const char *data, size_t size);
+// Read the next message into tc->read.buffer with the connection's framing
+int tcp_conn_read(tcp_conn_t *tc);
+
 // Export for tests
 JUICE_EXPORT void _juice_tcp_conn_init(tcp_conn_t *tc, tcp_framing_t framing);
 JUICE_EXPORT int _juice_tcp_ice_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context);

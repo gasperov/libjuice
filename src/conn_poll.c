@@ -470,7 +470,6 @@ int conn_poll_recv_udp(socket_t sock, char *buffer, size_t size, addr_record_t *
 void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t *tc) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 	const char *label = tcp_framing_to_string(tc->framing);
-	bool self_delimited = tc->framing == TCP_FRAMING_STUN || tc->framing == TCP_FRAMING_STUN_TLS;
 
 	if (pfd->revents & POLLNVAL) {
 		JLOG_WARN("Invalid %s socket", label);
@@ -524,9 +523,7 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 		mutex_lock(&conn_impl->send_mutex);
 		int ret = 0;
 		if (tc->write.pending) {
-			ret = self_delimited
-			    ? tcp_stun_write(tc->sock, NULL, 0, &tc->write, tc->tls)
-			    : tcp_ice_write(tc->sock, NULL, 0, &tc->write);
+			ret = tcp_conn_write(tc, NULL, 0);
 			if (ret >= 0)
 				JLOG_DEBUG("Finished sending %s message", label);
 		}
@@ -543,9 +540,7 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 		int left = 1000; // limit for fairness between sockets
 		tc->read_pending = false;
 		while (left--) {
-			ret = self_delimited
-				? tcp_stun_read(tc->sock, &tc->read, tc->tls)
-				: tcp_ice_read(tc->sock, &tc->read);
+			ret = tcp_conn_read(tc);
 			if (ret <= 0) {
 				break;
 			}
@@ -828,12 +823,9 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 			return -SEAGAIN;
 		}
 
-		bool self_delimited = tc->framing == TCP_FRAMING_STUN || tc->framing == TCP_FRAMING_STUN_TLS;
 		tcp_write_context_t *context = &tc->write;
 		if (!context->pending) {
-			ret = self_delimited
-			          ? tcp_stun_write(tc->sock, data, size, context, tc->tls)
-			          : tcp_ice_write(tc->sock, data, size, context);
+			ret = tcp_conn_write(tc, data, size);
 			if (context->pending && (ret == -SEAGAIN || ret == -SEWOULDBLOCK)) {
 				ret = (int)size; // datagram is buffered, consider it sent
 				interrupt_POLLOUT = true;

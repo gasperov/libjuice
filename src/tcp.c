@@ -221,75 +221,6 @@ int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_conte
 	return (int)context->length;
 }
 
-// recv()-compatible contract (>0 bytes copied, 0 on orderly close, negative incl. -SEAGAIN),
-// backed by TLS instead of the raw socket. A single STUN/ChannelData message can need bytes from
-// more than one TLS record, and a single decoded record can hold more plaintext than the current
-// message still needs, so delivering it can take several calls. Rather than shifting the cipher
-// state's buffer on every partial read, off/plain_off just advance in place; recv() is never
-// reached while plain_len > 0 (the branch below always returns first), so the two regions never
-// need to coexist past this point, and the buffer is only ever compacted once there is no room
-// left to receive into, not on every consume.
-static int tcp_stun_tls_recv(tls_client_t *tls, socket_t sock, char *dst, uint32_t cap) {
-	tls_cipher_state_t *cs = tls_client_cipher_state(tls);
-
-	for (;;) {
-		if (cs->plain_len > 0) {
-			uint32_t n = cs->plain_len < cap ? cs->plain_len : cap;
-			memcpy(dst, cs->buf + cs->plain_off, n);
-			cs->plain_off += n;
-			cs->plain_len -= n;
-			return (int)n;
-		}
-
-		if (cs->len > 0) {
-			char *pt;
-			size_t pt_len, consumed;
-			int ret = tls_decode(tls, cs->buf + cs->off, cs->len, &pt, &pt_len, &consumed);
-			if (ret < 0)
-				return -SECONNRESET;
-			if (ret == 2)
-				return 0; // peer's close_notify
-			if (ret == 1) {
-				size_t extra = cs->len - consumed;
-				// pt already points within buf (decryption happens in place); extra, if any, is
-				// the tail of the same input region, so advancing off past what was consumed
-				// lines it up without moving anything.
-				if (pt_len > 0)
-					cs->plain_off = (uint32_t)(pt - cs->buf);
-				cs->plain_len = (uint32_t)pt_len;
-				cs->off += (uint32_t)consumed;
-				cs->len = (uint32_t)extra;
-				continue; // deliver from the newly decoded plaintext above
-			}
-			// ret == 0: not a complete record yet, read more below
-		}
-
-		uint32_t tail_free = (uint32_t)sizeof(cs->buf) - cs->off - cs->len;
-		if (tail_free == 0) {
-			if (cs->off == 0) {
-				// Not just out of trailing room: this record's ciphertext alone doesn't fit even
-				// in a fully-compacted buffer.
-				JLOG_WARN("TLS record exceeds internal buffer");
-				return -SECONNRESET;
-			}
-			memmove(cs->buf, cs->buf + cs->off, cs->len);
-			cs->off = 0;
-			tail_free = (uint32_t)sizeof(cs->buf) - cs->len;
-		}
-
-		int n = recv(sock, cs->buf + cs->off + cs->len, (int)tail_free, 0);
-		if (n < 0) {
-			int ret = sockerrno;
-			if (ret == SEAGAIN || ret == SEWOULDBLOCK)
-				return -SEAGAIN;
-			return -ret;
-		}
-		if (n == 0)
-			return 0; // closed
-		cs->len += (uint32_t)n;
-	}
-}
-
 // Read raw STUN or ChannelData message from TCP socket (self-delimiting).
 // ChannelData is identified by is_channel_data() (same check as the UDP path, turn.c). A STUN
 // message can only be confirmed once its full 20-byte header has arrived, since that requires
@@ -325,8 +256,8 @@ int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls)
 			dst = buffer;
 		}
 
-		int len = tls ? tcp_stun_tls_recv(tls, sock, dst, remaining)
-		             : recv(sock, dst, remaining, flags);
+		int len = tls ? tls_client_recv(tls, sock, dst, remaining)
+		              : recv(sock, dst, remaining, flags);
 		if (len < 0) {
 			if (tls)
 				return len; // already a signed error code, not a raw sockerrno to translate
@@ -374,6 +305,17 @@ int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls)
 
 	context->pending = false;
 	return (int)avail;
+}
+
+int tcp_conn_write(tcp_conn_t *tc, const char *data, size_t size) {
+	return tc->framing == TCP_FRAMING_ICE
+	           ? tcp_ice_write(tc->sock, data, size, &tc->write)
+	           : tcp_stun_write(tc->sock, data, size, &tc->write, tc->tls);
+}
+
+int tcp_conn_read(tcp_conn_t *tc) {
+	return tc->framing == TCP_FRAMING_ICE ? tcp_ice_read(tc->sock, &tc->read)
+	                                      : tcp_stun_read(tc->sock, &tc->read, tc->tls);
 }
 
 const char *tcp_state_to_string(tcp_state_t state) {

@@ -22,6 +22,21 @@
 #pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "crypt32.lib")
 
+// Room for the largest STUN message (20-byte header + 65535) plus TLS record overhead. The
+// handshake uses the same buffer to accumulate the server's messages.
+#define TLS_CIPHER_BUFFER_SIZE (65555 + 256)
+
+// Received bytes: [off, off + len) is ciphertext not decoded yet, [plain_off, plain_off +
+// plain_len) is decrypted data not delivered yet. Decrypted data is always delivered before more
+// is received, so moving the ciphertext to the front never overwrites it.
+typedef struct tls_cipher_state {
+	char buf[TLS_CIPHER_BUFFER_SIZE];
+	uint32_t off;
+	uint32_t len;
+	uint32_t plain_off;
+	uint32_t plain_len;
+} tls_cipher_state_t;
+
 struct tls_client {
 	CredHandle cred;
 	CtxtHandle ctx;
@@ -80,10 +95,6 @@ void tls_client_destroy(tls_client_t *tls) {
 		FreeContextBuffer(tls->out_buf);
 	free(tls->hostname);
 	free(tls);
-}
-
-tls_cipher_state_t *tls_client_cipher_state(tls_client_t *tls) {
-	return &tls->cipher;
 }
 
 bool tls_client_wants_write(const tls_client_t *tls) {
@@ -229,9 +240,8 @@ int tls_client_handshake(tls_client_t *tls, socket_t sock) {
 		}
 
 		if (status == SEC_E_OK) {
-			// tls->cipher.len (leftover application-data bytes, if any) carries straight into
-			// the data phase; tls_decode() picks up from here on the first
-			// tls_client_cipher_state() call.
+			// Bytes left in tls->cipher after the handshake are application data, which
+			// tls_client_recv() decodes first
 			if (QueryContextAttributesW(&tls->ctx, SECPKG_ATTR_STREAM_SIZES, &tls->sizes) !=
 			    SEC_E_OK) {
 				JLOG_WARN("Failed to query TLS stream sizes after handshake");
@@ -307,8 +317,8 @@ int tls_encode(tls_client_t *tls, char *buf, size_t buf_capacity, size_t plain_s
 // buf that record occupied (EXTRA, if any, is always the trailing buf[*out_consumed..len)).
 // Returns 2 on the peer's close_notify, 0 if buf does not yet hold a complete record, <0 on
 // fatal error.
-int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
-               size_t *out_plaintext_len, size_t *out_consumed) {
+static int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
+                      size_t *out_plaintext_len, size_t *out_consumed) {
 	if (len == 0)
 		return 0;
 
@@ -361,6 +371,63 @@ int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
 	*out_plaintext_len = data_len;
 	*out_consumed = len - extra;
 	return 1;
+}
+
+int tls_client_recv(tls_client_t *tls, socket_t sock, char *dst, size_t cap) {
+	tls_cipher_state_t *cs = &tls->cipher;
+
+	for (;;) {
+		if (cs->plain_len > 0) {
+			uint32_t n = cs->plain_len < cap ? cs->plain_len : (uint32_t)cap;
+			memcpy(dst, cs->buf + cs->plain_off, n);
+			cs->plain_off += n;
+			cs->plain_len -= n;
+			return (int)n;
+		}
+
+		if (cs->len > 0) {
+			char *pt;
+			size_t pt_len, consumed;
+			int ret = tls_decode(tls, cs->buf + cs->off, cs->len, &pt, &pt_len, &consumed);
+			if (ret < 0)
+				return -SECONNRESET;
+			if (ret == 2)
+				return 0; // peer's close_notify
+			if (ret == 1) {
+				// Decrypted in place: the plaintext lies within buf, and what follows the
+				// consumed record is the start of the next one
+				if (pt_len > 0)
+					cs->plain_off = (uint32_t)(pt - cs->buf);
+				cs->plain_len = (uint32_t)pt_len;
+				cs->off += (uint32_t)consumed;
+				cs->len -= (uint32_t)consumed;
+				continue;
+			}
+			// ret == 0: the record is incomplete, receive more
+		}
+
+		uint32_t tail_free = (uint32_t)sizeof(cs->buf) - cs->off - cs->len;
+		if (tail_free == 0) {
+			if (cs->off == 0) {
+				JLOG_WARN("TLS record exceeds internal buffer");
+				return -SECONNRESET;
+			}
+			memmove(cs->buf, cs->buf + cs->off, cs->len);
+			cs->off = 0;
+			tail_free = (uint32_t)sizeof(cs->buf) - cs->len;
+		}
+
+		int n = recv(sock, cs->buf + cs->off + cs->len, (int)tail_free, 0);
+		if (n < 0) {
+			int ret = sockerrno;
+			if (ret == SEAGAIN || ret == SEWOULDBLOCK)
+				return -SEAGAIN;
+			return -ret;
+		}
+		if (n == 0)
+			return 0; // closed
+		cs->len += (uint32_t)n;
+	}
 }
 
 #endif // _WIN32 && USE_SCHANNEL

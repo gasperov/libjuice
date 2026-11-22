@@ -20,31 +20,6 @@
 // exists when SChannel support is actually compiled in.
 typedef struct tls_client tls_client_t;
 
-// Sized to fit the largest possible STUN/ChannelData datagram (STUN: STUN_HEADER_SIZE +
-// UINT16_MAX = 65555; ChannelData is smaller) plus slack for the TLS record header/trailer.
-// Also reused as the handshake accumulation buffer (see tls_client_handshake()): the two phases
-// never overlap, and this is far more room than any realistic certificate chain needs.
-#define TLS_CIPHER_BUFFER_SIZE (65555 + 256)
-
-// Data-phase ciphertext/plaintext staging buffer for one connection, embedded in and owned by
-// its tls_client_t, reached via tls_client_cipher_state() so tcp.c can drive the recv-side
-// accumulation loop itself instead of tls_schannel.c owning socket I/O. Holds two independently
-// positioned regions: [off..off+len) is ciphertext accumulated from the socket but not yet
-// decoded, and [plain_off..plain_off+plain_len) is plaintext already decoded but not yet consumed
-// by the caller (only meaningful while plain_len > 0). Decrypting in place leaves the plaintext
-// wherever SChannel put it rather than at a fixed offset, and the two regions are only ever
-// relevant one at a time (the ciphertext region is untouched by the caller while plaintext is
-// being drained), so tcp.c can advance off/plain_off as data is consumed instead of physically
-// shifting the buffer on every partial read; see tcp_stun_tls_recv() for where the one remaining
-// compaction (reclaiming leading space before recv()) happens.
-typedef struct tls_cipher_state {
-	char buf[TLS_CIPHER_BUFFER_SIZE];
-	uint32_t off;
-	uint32_t len;
-	uint32_t plain_off;
-	uint32_t plain_len;
-} tls_cipher_state_t;
-
 #if defined(_WIN32) && defined(USE_SCHANNEL)
 
 // hostname is used for SNI and certificate validation; copied internally.
@@ -55,14 +30,13 @@ void tls_client_destroy(tls_client_t *tls);
 // another poll() readiness event to make progress, -1 on fatal error.
 int tls_client_handshake(tls_client_t *tls, socket_t sock);
 
-// Pure transforms: no socket I/O of their own, operate only on the buffer/sizes given to them.
+// Encrypts buf[0..plain_size) in place into one TLS record. Returns the record size, which may
+// be up to buf_capacity, or a negative value on error.
 int tls_encode(tls_client_t *tls, char *buf, size_t buf_capacity, size_t plain_size);
-int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
-               size_t *out_plaintext_len, size_t *out_consumed);
 
-// Returns this connection's cipher state (len/plain_len start at 0), valid for the lifetime of
-// tls.
-tls_cipher_state_t *tls_client_cipher_state(tls_client_t *tls);
+// Like recv() on sock, but returns decrypted data: the number of bytes copied to dst (at most
+// cap), 0 once the peer closed, or a negative error (-SEAGAIN when nothing is available yet).
+int tls_client_recv(tls_client_t *tls, socket_t sock, char *dst, size_t cap);
 
 // True while a partially-sent handshake token is pending flush, i.e. the handshake needs the
 // socket to become writable; otherwise it is waiting to read the server's next flight.
@@ -101,16 +75,11 @@ static inline int tls_encode(tls_client_t *tls, char *buf, size_t buf_capacity, 
 	(void)tls; (void)buf; (void)buf_capacity; (void)plain_size;
 	return -1;
 }
-static inline int tls_decode(tls_client_t *tls, char *buf, size_t len, char **out_plaintext,
-                             size_t *out_plaintext_len, size_t *out_consumed) {
-	(void)tls; (void)buf; (void)len; (void)out_plaintext; (void)out_plaintext_len; (void)out_consumed;
+static inline int tls_client_recv(tls_client_t *tls, socket_t sock, char *dst, size_t cap) {
+	(void)tls; (void)sock; (void)dst; (void)cap;
 	return -1;
 }
 static inline void tls_client_destroy(tls_client_t *tls) { (void)tls; }
-static inline tls_cipher_state_t *tls_client_cipher_state(tls_client_t *tls) {
-	(void)tls;
-	return NULL;
-}
 static inline bool tls_client_wants_write(const tls_client_t *tls) {
 	(void)tls;
 	return false;
