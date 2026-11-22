@@ -22,6 +22,7 @@ void conn_poll_registry_cleanup(conn_registry_t *registry);
 
 int conn_poll_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_config_t *config);
 void conn_poll_cleanup(juice_agent_t *agent);
+bool conn_poll_defer_destroy(juice_agent_t *agent);
 void conn_poll_lock(juice_agent_t *agent);
 void conn_poll_unlock(juice_agent_t *agent);
 int conn_poll_interrupt(juice_agent_t *agent);

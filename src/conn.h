@@ -59,6 +59,7 @@ typedef struct conn_mode_entry {
 
 int conn_create(juice_agent_t *agent, udp_socket_config_t *config);
 void conn_destroy(juice_agent_t *agent);
+bool conn_defer_destroy(juice_agent_t *agent);
 void conn_lock(juice_agent_t *agent);
 void conn_unlock(juice_agent_t *agent);
 int conn_interrupt(juice_agent_t *agent);

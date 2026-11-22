@@ -222,6 +222,13 @@ void conn_destroy(juice_agent_t *agent) {
 	mutex_unlock(&entry->mutex);
 }
 
+bool conn_defer_destroy(juice_agent_t *agent) {
+	if (!agent->conn_impl || agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL)
+		return false;
+
+	return conn_poll_defer_destroy(agent);
+}
+
 void conn_lock(juice_agent_t *agent) {
 	if (!agent->conn_impl)
 		return;

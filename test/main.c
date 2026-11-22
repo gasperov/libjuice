@@ -18,6 +18,7 @@ int test_base64(void);
 int test_stun(void);
 int test_remote_description_early_stun(void);
 int test_connectivity(void);
+int test_destroy_from_callback(void);
 int test_thread(void);
 int test_mux(void);
 int test_notrickle(void);
@@ -84,6 +85,12 @@ int main(int argc, char **argv) {
 	printf("\nRunning connectivity test...\n");
 	if (test_connectivity()) {
 		fprintf(stderr, "Connectivity test failed\n");
+		return -1;
+	}
+
+	printf("\nRunning destroy from callback test...\n");
+	if (test_destroy_from_callback()) {
+		fprintf(stderr, "Destroy from callback test failed\n");
 		return -1;
 	}
 

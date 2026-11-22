@@ -84,6 +84,7 @@ set(TESTS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/gathering.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/remote-description.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/connectivity.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/destroy.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/turn.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/turn2.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/thread.c
