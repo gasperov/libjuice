@@ -261,25 +261,24 @@ void agent_destroy(juice_agent_t *agent) {
 }
 
 static bool has_nonnumeric_server_hostnames(const juice_agent_t *agent) {
-	if (agent->config.stun_server_host &&
-	    !addr_is_numeric_hostname(agent->config.stun_server_host, SOCK_DGRAM))
+	if (agent->config.stun_server_host && !addr_is_numeric_hostname(agent->config.stun_server_host))
 		return true;
 
 	for (int i = 0; i < agent->config.turn_servers_count; ++i) {
 		const juice_turn_server_t *s = agent->config.turn_servers + i;
-		if (s->host && !addr_is_numeric_hostname(s->host, SOCK_DGRAM))
+		if (s->host && !addr_is_numeric_hostname(s->host))
 			return true;
 	}
 
 	for (int i = 0; i < agent->turn_servers_tcp_count; ++i) {
 		const juice_turn_server_t *s = agent->turn_servers_tcp + i;
-		if (s->host && !addr_is_numeric_hostname(s->host, SOCK_STREAM))
+		if (s->host && !addr_is_numeric_hostname(s->host))
 			return true;
 	}
 
 	for (int i = 0; i < agent->turn_servers_tls_count; ++i) {
 		const juice_turn_server_t *s = agent->turn_servers_tls + i;
-		if (s->host && !addr_is_numeric_hostname(s->host, SOCK_STREAM))
+		if (s->host && !addr_is_numeric_hostname(s->host))
 			return true;
 	}
 
@@ -1214,31 +1213,14 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 			// Failure sending or end of retransmissions
 			JLOG_DEBUG("STUN entry %d: Failed", i);
-			if (entry_is_tcp(entry)) {
-				conn_tcp_close(agent, &entry->record);
-				entry->tcp_state = TCP_STATE_FAILED;
-			}
-			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
-			entry->next_transmission = 0;
-
-			switch (entry->type) {
-			case AGENT_STUN_ENTRY_TYPE_RELAY:
+			if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY)
 				JLOG_INFO("TURN allocation failed");
-				agent_update_gathering_done(agent);
-				break;
-
-			case AGENT_STUN_ENTRY_TYPE_SERVER:
+			else if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER)
 				JLOG_INFO("STUN server binding failed");
-				agent_update_gathering_done(agent);
-				break;
+			else if (entry->pair)
+				JLOG_DEBUG("Candidate pair check failed");
 
-			default:
-				if (entry->pair) {
-					JLOG_DEBUG("Candidate pair check failed");
-					entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
-				}
-				break;
-			}
+			agent_fail_stun_entry(agent, entry);
 		}
 		// STUN keepalives
 		else if (entry->state == AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
@@ -2047,6 +2029,26 @@ int agent_send_stun_binding(juice_agent_t *agent, agent_stun_entry_t *entry, stu
 	return 0;
 }
 
+// A relay allocated: cancel the pending relay entries of a strictly worse transport tier
+// (UDP < TURN-TCP < TURNS), closing their connection if any. Equal or better tiers keep trying.
+static void agent_cancel_worse_relays(juice_agent_t *agent, const agent_stun_entry_t *entry) {
+	int rank = relay_entry_rank(entry);
+	for (int i = 0; i < agent->entries_count; ++i) {
+		agent_stun_entry_t *other = agent->entries + i;
+		if (other->type != AGENT_STUN_ENTRY_TYPE_RELAY ||
+		    other->state != AGENT_STUN_ENTRY_STATE_PENDING || relay_entry_rank(other) <= rank)
+			continue;
+
+		JLOG_DEBUG("STUN entry %d: Cancelled, a better TURN transport was allocated", i);
+		if (entry_is_tcp(other) && other->tcp_state != TCP_STATE_DISCONNECTED) {
+			conn_tcp_close(agent, &other->record);
+			other->tcp_state = TCP_STATE_DISCONNECTED;
+		}
+		other->state = AGENT_STUN_ENTRY_STATE_CANCELLED;
+		other->next_transmission = 0;
+	}
+}
+
 int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
                                 agent_stun_entry_t *entry) {
 	if (msg->msg_method != STUN_METHOD_ALLOCATE && msg->msg_method != STUN_METHOD_REFRESH)
@@ -2121,28 +2123,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			JLOG_INFO("Allocated TURN relayed address %s", relayed_str);
 		}
 
-		{
-			// A relay of a given transport tier succeeding means any pending relay entry in a
-			// strictly worse tier (UDP < TURN-TCP < TURNS) that has not allocated yet can be
-			// cancelled, closing its connection if it was already connecting; entries in an equal
-			// or better tier are left to keep trying.
-			int rank = relay_entry_rank(entry);
-			for (int i = 0; i < agent->entries_count; ++i) {
-				agent_stun_entry_t *other_entry = agent->entries + i;
-				if (other_entry->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
-				    relay_entry_rank(other_entry) > rank &&
-				    other_entry->state == AGENT_STUN_ENTRY_STATE_PENDING) {
-					JLOG_DEBUG("STUN entry %d: Cancelled worse-tier TURN entry after a better relay succeeded", i);
-					if (entry_is_tcp(other_entry) && other_entry->tcp_state != TCP_STATE_DISCONNECTED) {
-						conn_tcp_close(agent, &other_entry->record);
-						other_entry->tcp_state = TCP_STATE_DISCONNECTED;
-					}
-					other_entry->state = AGENT_STUN_ENTRY_STATE_CANCELLED;
-					other_entry->next_transmission = 0;
-				}
-			}
-		}
-
+		agent_cancel_worse_relays(agent, entry);
 		agent_update_gathering_done(agent);
 		break;
 	}

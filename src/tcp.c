@@ -47,7 +47,6 @@ socket_t tcp_create_socket(const addr_record_t *dst) {
 		goto error;
 	}
 
-	JLOG_DEBUG("TCP socket created, non-blocking connect initiated");
 	return sock;
 
 error:

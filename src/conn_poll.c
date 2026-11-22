@@ -295,7 +295,8 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 
 			if (tc->state == TCP_STATE_CONNECTING || tc->state == TCP_STATE_TLS_HANDSHAKING) {
 				if (now >= tc->connect_deadline) {
-					JLOG_INFO("%s connect/handshake timed out", tcp_framing_to_string(tc->framing));
+					JLOG_DEBUG("%s connect/handshake timed out",
+					           tcp_framing_to_string(tc->framing));
 					mutex_lock(&conn_impl->agent_mutex);
 					conn_poll_change_tcp_fail(agent, tc);
 					mutex_unlock(&conn_impl->agent_mutex);
@@ -486,22 +487,20 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 		int err = 0;
 		socklen_t errlen = sizeof(err);
 		if (getsockopt(tc->sock, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen) != 0) {
-			JLOG_INFO("Failed to get %s socket error code, errno=%d", label, sockerrno);
+			JLOG_DEBUG("Failed to get %s socket error code, errno=%d", label, sockerrno);
 			conn_poll_change_tcp_fail(agent, tc);
 			return;
 		}
 
 		if (err != 0) {
-			JLOG_INFO("%s connection failed on SO_ERROR, errno=%d", label, err);
+			JLOG_DEBUG("%s connection failed, errno=%d", label, err);
 			conn_poll_change_tcp_fail(agent, tc);
 			return;
 		}
 
 		if (tc->framing == TCP_FRAMING_STUN_TLS) {
-			JLOG_INFO("%s TCP connected, starting TLS handshake", label);
 			conn_poll_change_tcp_state(agent, tc, TCP_STATE_TLS_HANDSHAKING);
 		} else {
-			JLOG_INFO("%s connection established (POLLOUT with no error)", label);
 			conn_poll_change_tcp_state(agent, tc, TCP_STATE_CONNECTED);
 			return;
 		}
@@ -513,10 +512,9 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 			return;
 		int ret = tls_client_handshake(tc->tls, tc->sock);
 		if (ret < 0) {
-			JLOG_INFO("%s handshake failed", label);
+			JLOG_DEBUG("%s handshake failed", label);
 			conn_poll_change_tcp_fail(agent, tc);
 		} else if (ret == 1) {
-			JLOG_INFO("%s handshake complete", label);
 			conn_poll_change_tcp_state(agent, tc, TCP_STATE_CONNECTED);
 		}
 		return;
@@ -595,7 +593,6 @@ void conn_poll_process_tcp(juice_agent_t *agent, struct pollfd *pfd, tcp_conn_t 
 
 void conn_poll_change_tcp_fail(juice_agent_t *agent, tcp_conn_t *tc) {
 	conn_impl_t *conn_impl = agent->conn_impl;
-	JLOG_INFO("%s connection closing socket and marking failed", tcp_framing_to_string(tc->framing));
 	conn_poll_close_tcp(conn_impl, tc);
 	conn_poll_change_tcp_state(agent, tc, TCP_STATE_FAILED);
 }
@@ -959,7 +956,7 @@ void conn_poll_tcp_connect(juice_agent_t *agent, const addr_record_t *dst, tcp_f
 		JLOG_DEBUG("Attempting %s connection to %s", label, dst_str);
 		tc->sock = tcp_create_socket(dst);
 		if (tc->sock == INVALID_SOCKET) {
-			JLOG_WARN("%s socket creation failed for %s", label, dst_str);
+			JLOG_DEBUG("%s socket creation failed for %s", label, dst_str);
 			tcp_conn_reset(tc);
 		} else {
 			memcpy(&tc->dst, dst, sizeof(tc->dst));
