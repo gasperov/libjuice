@@ -221,11 +221,8 @@ int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_conte
 	return (int)context->length;
 }
 
-// Read raw STUN or ChannelData message from TCP socket (self-delimiting).
-// ChannelData is identified by is_channel_data() (same check as the UDP path, turn.c). A STUN
-// message can only be confirmed once its full 20-byte header has arrived, since that requires
-// validating the magic cookie via is_stun_datagram() (stun.c) rather than just the top-2-bits
-// heuristic used below to size the frame while it is still being read.
+// Read raw STUN or ChannelData message from TCP socket (self-delimiting). The first 4 bytes give
+// the type and length; a STUN message is only validated once complete, with is_stun_datagram().
 int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls) {
 #if defined(__APPLE__) || defined(_WIN32)
 	int flags = 0;
@@ -278,18 +275,12 @@ int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls)
 			memcpy(&payload_len, context->buffer + 2, sizeof(uint16_t));
 			payload_len = ntohs(payload_len);
 
-			// Total length in 32 bits: STUN tops out at 20 + 65535 = 65555 and ChannelData
-			// (padded) at 4 + 65536 = 65540, both of which exceed UINT16_MAX, so this cannot be
-			// tracked in a 16-bit counter. context->length/bytes_read are 32-bit for this reason;
-			// bytes beyond TCP_BUFFER_SIZE are still just drained and discarded above, like a
-			// datagram socket truncating an oversized read, rather than desyncing framing or
-			// tearing down the connection over a message that is merely large.
+			// STUN and padded ChannelData can exceed 65535 bytes in total, so this is 32-bit
 			uint32_t total;
 			if (is_channel_data(context->buffer, context->bytes_read)) {
 				total = (uint32_t)CHANNEL_DATA_HEADER_SIZE + (((uint32_t)payload_len + 3) & ~3u);
 			} else if ((context->buffer[0] & 0xC0) == 0) {
-				// RFC 8489: top 2 bits zero is necessary but not sufficient for STUN; the magic
-				// cookie is checked against is_stun_datagram() below once the full header is in.
+				// Looks like STUN (RFC 8489: top 2 bits zero), validated once complete
 				total = (uint32_t)STUN_HEADER_SIZE + payload_len;
 			} else {
 				return -SECONNRESET; // neither STUN nor ChannelData: invalid framing
@@ -338,9 +329,7 @@ const char *tcp_framing_to_string(tcp_framing_t framing) {
 	}
 }
 
-// Assumes no meaningful prior state (fresh calloc, or a slot already cleared by
-// tcp_conn_reset()): does not free an existing tc->tls, so this is safe to call on an
-// uninitialized tcp_conn_t (as the test helpers do), unlike tcp_conn_reset() below.
+// Initializes a new or reset connection; unlike tcp_conn_reset(), it does not free tc->tls
 void tcp_conn_init(tcp_conn_t *tc, tcp_framing_t framing) {
 	tc->sock = INVALID_SOCKET;
 	tc->state = TCP_STATE_DISCONNECTED;

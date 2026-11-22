@@ -23,30 +23,19 @@ typedef enum tcp_state {
 	TCP_STATE_FAILED
 } tcp_state_t;
 
-// Bounds TCP connect + (if applicable) TLS handshake: a peer that accepts the TCP connection but
-// never completes the handshake (bad TLS config, silently dropped traffic, ...) would otherwise
-// leave the connection in TCP_STATE_CONNECTING/TLS_HANDSHAKING forever, with nothing to time it
-// out (no socket event ever fires once the peer goes silent).
+// Limit for the TCP connect plus any TLS handshake, as a silent peer triggers no socket event
 #define TCP_CONNECT_TIMEOUT 8000 // msecs
 
 socket_t tcp_create_socket(const addr_record_t *dst);
 
-// Matches BUFFER_SIZE in agent.c/conn_poll.c, so anything that fits through the UDP relay path
-// also fits through TURN-TCP/TURNS.
+// Same as BUFFER_SIZE in agent.c and conn_poll.c, so anything the UDP relay path carries fits
 #define TCP_BUFFER_SIZE 4096
 
-// Extra room reserved in the buffers below for a TLS record header+trailer when framing runs
-// over TLS (TURNS), so a max-size plaintext message's ciphertext still fits in place. Real
-// overhead (queried from cbHeader/cbTrailer after the handshake) is a fraction of this for the
-// AEAD cipher suites Windows negotiates by default (e.g. AES-GCM: ~29 bytes); this is just a
-// safe fixed upper bound so the struct layout doesn't depend on what gets negotiated at runtime.
+// Room for a TLS record header and trailer around a full buffer (AES-GCM needs about 29 bytes)
 #define TLS_RECORD_OVERHEAD_RESERVE 128
 #define TCP_CONTEXT_BUFFER_SIZE (TCP_BUFFER_SIZE + TLS_RECORD_OVERHEAD_RESERVE)
 
-// STUN messages: 20-byte header, length at bytes 2-3 (payload only, total = 20 + length)
-// ChannelData:    4-byte header, length at bytes 2-3 (payload only, total = 4 + length)
-// Disambiguated using the same checks as the UDP path: is_channel_data() (turn.h) and
-// is_stun_datagram() (stun.h), not a locally redefined byte range.
+// Header sizes; bytes 2-3 hold the length of what follows the header in both
 #define STUN_HEADER_SIZE 20
 #define CHANNEL_DATA_HEADER_SIZE 4
 
@@ -60,10 +49,7 @@ typedef struct tcp_write_context {
 
 typedef struct tcp_read_context {
 	char buffer[TCP_BUFFER_SIZE];
-	// 32-bit: STUN/ChannelData framing (TURN-TCP) allows a total message length up to
-	// STUN_HEADER_SIZE + UINT16_MAX = 65555, which does not fit in 16 bits. Only bytes up to
-	// TCP_BUFFER_SIZE are ever kept; anything beyond that is drained and discarded, but the
-	// full length must still be tracked accurately so the next frame stays in sync.
+	// Full message length, which can exceed 16 bits; bytes past TCP_BUFFER_SIZE are discarded
 	uint32_t length;
 	uint32_t bytes_read; // 0 if finished
 	uint16_t header; // 2-byte length prefix (ICE framing only)
@@ -74,8 +60,7 @@ typedef struct tcp_read_context {
 int tcp_ice_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context);
 int tcp_ice_read(socket_t sock, tcp_read_context_t *context);
 
-// Self-delimiting STUN/ChannelData framing used for TURN-TCP. tls is NULL for plain TURN-TCP;
-// when set, I/O goes through it instead of the raw socket (TURNS).
+// Self-delimiting STUN/ChannelData framing for TURN-TCP, over TLS (TURNS) when tls is set
 int tcp_stun_write(socket_t sock, const char *data, size_t size, tcp_write_context_t *context,
                    tls_client_t *tls);
 int tcp_stun_read(socket_t sock, tcp_read_context_t *context, tls_client_t *tls);
