@@ -138,12 +138,6 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 		}
 	}
 
-	agent->turn_servers_tcp = NULL;
-	agent->turn_servers_tcp_count = 0;
-	agent->turn_servers_tls = NULL;
-	agent->turn_servers_tls_count = 0;
-	agent->turn_servers_tls_insecure = NULL;
-
 	agent->state = JUICE_STATE_DISCONNECTED;
 	agent->mode = AGENT_MODE_UNKNOWN;
 	agent->selected_entry = NULL;
@@ -235,21 +229,13 @@ void agent_destroy(juice_agent_t *agent) {
 		free((void *)turn_server->password);
 	}
 	free(agent->config.turn_servers);
-	for (int i = 0; i < agent->turn_servers_tcp_count; ++i) {
-		juice_turn_server_t *turn_server = agent->turn_servers_tcp + i;
+	for (int i = 0; i < agent->stream_turn_servers_count; ++i) {
+		juice_turn_server_t *turn_server = &agent->stream_turn_servers[i].server;
 		free((void *)turn_server->host);
 		free((void *)turn_server->username);
 		free((void *)turn_server->password);
 	}
-	free(agent->turn_servers_tcp);
-	for (int i = 0; i < agent->turn_servers_tls_count; ++i) {
-		juice_turn_server_t *turn_server = agent->turn_servers_tls + i;
-		free((void *)turn_server->host);
-		free((void *)turn_server->username);
-		free((void *)turn_server->password);
-	}
-	free(agent->turn_servers_tls);
-	free(agent->turn_servers_tls_insecure);
+	free(agent->stream_turn_servers);
 	free((void *)agent->config.bind_address);
 	free(agent);
 
@@ -270,14 +256,8 @@ static bool has_nonnumeric_server_hostnames(const juice_agent_t *agent) {
 			return true;
 	}
 
-	for (int i = 0; i < agent->turn_servers_tcp_count; ++i) {
-		const juice_turn_server_t *s = agent->turn_servers_tcp + i;
-		if (s->host && !addr_is_numeric_hostname(s->host))
-			return true;
-	}
-
-	for (int i = 0; i < agent->turn_servers_tls_count; ++i) {
-		const juice_turn_server_t *s = agent->turn_servers_tls + i;
+	for (int i = 0; i < agent->stream_turn_servers_count; ++i) {
+		const juice_turn_server_t *s = &agent->stream_turn_servers[i].server;
 		if (s->host && !addr_is_numeric_hostname(s->host))
 			return true;
 	}
@@ -424,113 +404,95 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	return ret ? -1 : 0;
 }
 
-static void agent_resolve_turn_servers(juice_agent_t *agent, juice_turn_server_t *servers, int servers_count,
-										int socktype, int *count, int max_count, timediff_t tcp_connect_delay,
-										bool tls, const bool *tls_insecure) {
+// Resolves a TURN server and registers a relay entry for it, returns true if one was added
+static bool agent_add_relay_entry(juice_agent_t *agent, juice_turn_server_t *turn_server,
+                                  int socktype, bool tls, bool tls_insecure, timediff_t delay) {
+	if (!turn_server->host)
+		return false;
+
+	if (!turn_server->port)
+		turn_server->port = tls ? 5349 : 3478; // default TURN port
 
 	const char *proto = socktype == SOCK_DGRAM ? "UDP" : (tls ? "TLS" : "TCP");
-	bool has_entries = *count;
-	for (int i = 0; i < servers_count; ++i) {
-		if (*count >= max_count) {
-			JLOG_WARN("Relay entry limit (%d) reached, ignoring remaining %s TURN server(s)",
-			          max_count, proto);
+	char hostname[256];
+	char service[8];
+	snprintf(hostname, 256, "%s", turn_server->host);
+	snprintf(service, 8, "%hu", turn_server->port);
+
+	conn_unlock(agent);
+
+	addr_record_t records[DEFAULT_MAX_RECORDS_COUNT];
+	int records_count =
+	    addr_resolve(hostname, service, socktype, records, DEFAULT_MAX_RECORDS_COUNT);
+
+	conn_lock(agent);
+
+	if (records_count <= 0) {
+		JLOG_ERROR("TURN address resolution failed");
+		return false;
+	}
+	if (records_count > DEFAULT_MAX_RECORDS_COUNT)
+		records_count = DEFAULT_MAX_RECORDS_COUNT;
+
+	JLOG_INFO("Using TURN server %s:%s over %s", hostname, service, proto);
+
+	addr_record_t *record = NULL;
+	for (int j = 0; j < records_count; ++j) {
+		int family = records[j].addr.ss_family;
+		// Prefer IPv4 for TURN
+		if (family == AF_INET) {
+			record = records + j;
 			break;
 		}
+		if (family == AF_INET6 && !record)
+			record = records + j;
+	}
+	if (!record)
+		return false;
 
-		juice_turn_server_t *turn_server = servers + i;
-		if (!turn_server->host)
-			continue;
-
-		if (!turn_server->port)
-			turn_server->port = tls ? 5349 : 3478; // default TURN port
-
-		char hostname[256];
-		char service[8];
-		snprintf(hostname, 256, "%s", turn_server->host);
-		snprintf(service, 8, "%hu", turn_server->port);
-
-		conn_unlock(agent);
-
-		addr_record_t records[DEFAULT_MAX_RECORDS_COUNT];
-		int records_count =
-		    addr_resolve(hostname, service, socktype, records, DEFAULT_MAX_RECORDS_COUNT);
-
-		conn_lock(agent);
-
-		if (records_count > 0) {
-			if (records_count > DEFAULT_MAX_RECORDS_COUNT)
-				records_count = DEFAULT_MAX_RECORDS_COUNT;
-
-			JLOG_INFO("Using TURN server %s:%s over %s", hostname, service, proto);
-
-			addr_record_t *record = NULL;
-			for (int j = 0; j < records_count; ++j) {
-				int family = records[j].addr.ss_family;
-				if (family == AF_INET) {
-					record = records + j;
-					break;
-				}
-				if (family == AF_INET6 && !record)
-					record = records + j;
-			}
-			if (record) {
-				bool is_duplicate = false;
-				for (int k = 0; k < agent->entries_count; ++k) {
-					agent_stun_entry_t *other = agent->entries + k;
-					if (other->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
-					    addr_record_is_equal(&other->record, record, true)) {
-						is_duplicate = true;
-						if (other->tls != tls)
-							JLOG_WARN("TURN server %s:%s over %s ignored: this address is already "
-							          "used over %s, configure a distinct port",
-							          hostname, service, proto, other->tls ? "TLS" : "TCP");
-						else
-							JLOG_INFO("Duplicate TURN server, ignoring");
-						break;
-					}
-				}
-				if (is_duplicate)
-					continue;
-
-				JLOG_VERBOSE("Registering STUN entry %d for relay request",
-				             agent->entries_count);
-				agent_stun_entry_t *entry = agent->entries + agent->entries_count;
-				entry->type = AGENT_STUN_ENTRY_TYPE_RELAY;
-				entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
-				entry->pair = NULL;
-				entry->record = *record;
-				entry->turn_redirections = 0;
-				entry->tls = tls;
-				entry->tls_hostname = tls ? turn_server->host : NULL;
-				entry->tls_insecure = tls && tls_insecure ? tls_insecure[i] : false;
-				entry->turn = calloc(1, sizeof(agent_turn_state_t));
-				if (!entry->turn) {
-					JLOG_ERROR("Memory allocation for TURN state failed");
-					break;
-				}
-				if (turn_init_map(&entry->turn->map, AGENT_TURN_MAP_SIZE) < 0) {
-					free(entry->turn);
-					break;
-				}
-				snprintf(entry->turn->credentials.username, STUN_MAX_USERNAME_LEN, "%s",
-				         turn_server->username);
-				entry->turn->password = turn_server->password;
-				juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
-				entry->transaction_id_expired = false;
-				++agent->entries_count;
-
-				timediff_t arm_delay = STUN_PACING_TIME * (*count);
-				if (has_entries && socktype == SOCK_STREAM) {
-					arm_delay += tcp_connect_delay;
-				}
-				agent_arm_transmission(agent, entry, arm_delay);
-
-				++(*count);
-			}
-		} else {
-			JLOG_ERROR("TURN address resolution failed");
+	// Ignore duplicate TURN servers as they will cause conflicts
+	for (int k = 0; k < agent->entries_count; ++k) {
+		agent_stun_entry_t *other = agent->entries + k;
+		if (other->type == AGENT_STUN_ENTRY_TYPE_RELAY &&
+		    addr_record_is_equal(&other->record, record, true)) {
+			if (other->tls != tls)
+				JLOG_WARN("TURN server %s:%s over %s ignored: this address is already used "
+				          "over %s, configure a distinct port",
+				          hostname, service, proto, other->tls ? "TLS" : "TCP");
+			else
+				JLOG_INFO("Duplicate TURN server, ignoring");
+			return false;
 		}
 	}
+
+	JLOG_VERBOSE("Registering STUN entry %d for relay request", agent->entries_count);
+	agent_stun_entry_t *entry = agent->entries + agent->entries_count;
+	entry->type = AGENT_STUN_ENTRY_TYPE_RELAY;
+	entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
+	entry->pair = NULL;
+	entry->record = *record;
+	entry->turn_redirections = 0;
+	entry->tls = tls;
+	entry->tls_hostname = tls ? turn_server->host : NULL;
+	entry->tls_insecure = tls && tls_insecure;
+	entry->turn = calloc(1, sizeof(agent_turn_state_t));
+	if (!entry->turn) {
+		JLOG_ERROR("Memory allocation for TURN state failed");
+		return false;
+	}
+	if (turn_init_map(&entry->turn->map, AGENT_TURN_MAP_SIZE) < 0) {
+		free(entry->turn);
+		return false;
+	}
+	snprintf(entry->turn->credentials.username, STUN_MAX_USERNAME_LEN, "%s",
+	         turn_server->username);
+	entry->turn->password = turn_server->password;
+	juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
+	entry->transaction_id_expired = false;
+	++agent->entries_count;
+
+	agent_arm_transmission(agent, entry, delay);
+	return true;
 }
 
 int agent_resolve_servers(juice_agent_t *agent) {
@@ -543,30 +505,49 @@ int agent_resolve_servers(juice_agent_t *agent) {
 			JLOG_WARN("TURN servers are not supported in mux mode");
 
 	} else {
+		// Relay entries are capped at MAX_RELAY_ENTRIES_COUNT in total, which also sizes
+		// MAX_CANDIDATE_PAIRS_COUNT. Reserve one for each stream transport in use, so a full set
+		// of UDP servers can't crowd it out.
+		int tcp_reserved = 0;
+		int tls_reserved = 0;
+		for (int i = 0; i < agent->stream_turn_servers_count; ++i) {
+			if (agent->stream_turn_servers[i].tls)
+				tls_reserved = 1;
+			else
+				tcp_reserved = 1;
+		}
+
 		int count = 0;
-
-		// Relay entries are capped at MAX_RELAY_ENTRIES_COUNT total (shared across UDP, TCP and
-		// TLS servers, since that bound also sizes MAX_CANDIDATE_PAIRS_COUNT). Reserve one slot
-		// for each configured stream transport, so neither TCP nor TLS gets starved out by a
-		// full complement of UDP servers.
-		int tcp_reserved = agent->turn_servers_tcp_count > 0 ? 1 : 0;
-		int tls_reserved = agent->turn_servers_tls_count > 0 ? 1 : 0;
 		int udp_max = MAX_RELAY_ENTRIES_COUNT - tcp_reserved - tls_reserved;
-		if (udp_max < 0)
-			udp_max = 0;
+		for (int i = 0; i < agent->config.turn_servers_count; ++i) {
+			if (count >= udp_max) {
+				JLOG_WARN("Relay entry limit reached, ignoring remaining UDP TURN servers");
+				break;
+			}
+			if (agent_add_relay_entry(agent, agent->config.turn_servers + i, SOCK_DGRAM, false,
+			                          false, STUN_PACING_TIME * count))
+				++count;
+		}
 
-		timediff_t fallback_delay = agent->config.turn_servers_count > 0 ? TURN_TCP_DELAY_START : 0;
-
-		agent_resolve_turn_servers(agent, agent->config.turn_servers,
-		                           agent->config.turn_servers_count, SOCK_DGRAM, &count, udp_max, 0,
-		                           false, NULL);
-		agent_resolve_turn_servers(agent, agent->turn_servers_tcp,
-		                           agent->turn_servers_tcp_count, SOCK_STREAM, &count,
-		                           MAX_RELAY_ENTRIES_COUNT - tls_reserved, fallback_delay, false, NULL);
-		agent_resolve_turn_servers(agent, agent->turn_servers_tls,
-		                           agent->turn_servers_tls_count, SOCK_STREAM, &count,
-		                           MAX_RELAY_ENTRIES_COUNT, fallback_delay, true,
-		                           agent->turn_servers_tls_insecure);
+		// Start stream relays later when a UDP relay exists, so it gets to allocate first
+		timediff_t stream_delay = count > 0 ? TURN_TCP_DELAY_START : 0;
+		for (int pass = 0; pass < 2; ++pass) { // TCP first, then TLS
+			bool tls = pass == 1;
+			int max = tls ? MAX_RELAY_ENTRIES_COUNT : MAX_RELAY_ENTRIES_COUNT - tls_reserved;
+			for (int i = 0; i < agent->stream_turn_servers_count; ++i) {
+				agent_stream_turn_server_t *s = agent->stream_turn_servers + i;
+				if (s->tls != tls)
+					continue;
+				if (count >= max) {
+					JLOG_WARN("Relay entry limit reached, ignoring remaining %s TURN servers",
+					          tls ? "TLS" : "TCP");
+					break;
+				}
+				if (agent_add_relay_entry(agent, &s->server, SOCK_STREAM, tls, s->tls_insecure,
+				                          stream_delay + STUN_PACING_TIME * count))
+					++count;
+			}
+		}
 	}
 
 	// STUN server resolution
@@ -771,84 +752,73 @@ int agent_set_local_ice_attributes(juice_agent_t *agent, const char *ufrag, cons
 	return JUICE_ERR_SUCCESS;
 }
 
-static int agent_add_turn_server_to_list(juice_turn_server_t **list, int *count,
-                                   const juice_turn_server_t *turn_server) {
-	juice_turn_server_t *new_list =
-	    realloc(*list, (*count + 1) * sizeof(juice_turn_server_t));
-	if (!new_list) {
-		JLOG_FATAL("Memory allocation for TURN servers failed");
-		return -1;
-	}
-	memset(new_list + *count, 0, sizeof(juice_turn_server_t));
-	*list = new_list;
-	if (copy_turn_server(new_list + *count, turn_server) < 0)
-		return -1;
-	++(*count);
-	return 0;
-}
-
 int agent_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_server) {
 	if (agent->conn_impl) {
+		// The array must no be reallocated anymore after gathering started
 		JLOG_WARN("Unable to add TURN server, candidates gathering already started");
 		return -1;
 	}
-	return agent_add_turn_server_to_list(&agent->config.turn_servers, &agent->config.turn_servers_count,
-	                               turn_server);
+
+	juice_turn_server_t *new_turn_servers =
+	    realloc(agent->config.turn_servers,
+	            (agent->config.turn_servers_count + 1) * sizeof(juice_turn_server_t));
+	if (!new_turn_servers) {
+		JLOG_FATAL("Memory allocation for TURN servers failed");
+		return -1;
+	}
+	memset(new_turn_servers + agent->config.turn_servers_count, 0, sizeof(juice_turn_server_t));
+	agent->config.turn_servers = new_turn_servers;
+	if (copy_turn_server(new_turn_servers + agent->config.turn_servers_count, turn_server) < 0) {
+		return -1;
+	}
+	agent->config.turn_servers_count++;
+	return 0;
 }
 
-int agent_add_turn_server_tcp(juice_agent_t *agent, const juice_turn_server_t *turn_server) {
+static int agent_add_stream_turn_server(juice_agent_t *agent,
+                                        const juice_turn_server_t *turn_server, bool tls,
+                                        bool tls_insecure) {
 	if (agent->conn_impl) {
+		// The array must no be reallocated anymore after gathering started
 		JLOG_WARN("Unable to add TURN server, candidates gathering already started");
 		return -1;
 	}
 	if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL) {
-		JLOG_WARN("TURN over TCP is only supported in poll concurrency mode");
+		JLOG_WARN("TURN over %s is only supported in poll concurrency mode", tls ? "TLS" : "TCP");
 		return -1;
 	}
-	return agent_add_turn_server_to_list(&agent->turn_servers_tcp,
-	                               &agent->turn_servers_tcp_count, turn_server);
+
+	agent_stream_turn_server_t *list =
+	    realloc(agent->stream_turn_servers, (agent->stream_turn_servers_count + 1) * sizeof(*list));
+	if (!list) {
+		JLOG_FATAL("Memory allocation for TURN servers failed");
+		return -1;
+	}
+	agent->stream_turn_servers = list;
+	agent_stream_turn_server_t *s = list + agent->stream_turn_servers_count;
+	memset(s, 0, sizeof(*s));
+	if (copy_turn_server(&s->server, turn_server) < 0)
+		return -1;
+	s->tls = tls;
+	s->tls_insecure = tls_insecure;
+	++agent->stream_turn_servers_count;
+	return 0;
+}
+
+int agent_add_turn_server_tcp(juice_agent_t *agent, const juice_turn_server_t *turn_server) {
+	return agent_add_stream_turn_server(agent, turn_server, false, false);
 }
 
 int agent_add_turn_server_tls(juice_agent_t *agent, const juice_turn_server_t *turn_server,
                               bool insecure_skip_verify) {
-	if (agent->conn_impl) {
-		JLOG_WARN("Unable to add TURN server, candidates gathering already started");
-		return -1;
-	}
-	if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_POLL) {
-		JLOG_WARN("TURN over TLS is only supported in poll concurrency mode");
-		return -1;
-	}
-#if !defined(_WIN32) || !defined(USE_SCHANNEL)
+#if defined(_WIN32) && defined(USE_SCHANNEL)
+	return agent_add_stream_turn_server(agent, turn_server, true, insecure_skip_verify);
+#else
+	(void)agent;
 	(void)turn_server;
 	(void)insecure_skip_verify;
 	JLOG_WARN("TURN over TLS requires SChannel support (built with USE_SCHANNEL on Windows)");
 	return -1;
-#else
-	// Grow both arrays before touching either's count, so a failure partway through can't leave
-	// turn_servers_tls_insecure shorter than turn_servers_tls_count.
-	int new_count = agent->turn_servers_tls_count + 1;
-	juice_turn_server_t *new_servers =
-	    realloc(agent->turn_servers_tls, (size_t)new_count * sizeof(juice_turn_server_t));
-	if (!new_servers) {
-		JLOG_FATAL("Memory allocation for TURN servers failed");
-		return -1;
-	}
-	agent->turn_servers_tls = new_servers;
-
-	bool *new_insecure = realloc(agent->turn_servers_tls_insecure, (size_t)new_count * sizeof(bool));
-	if (!new_insecure) {
-		JLOG_FATAL("Memory allocation for TURN server flags failed");
-		return -1;
-	}
-	agent->turn_servers_tls_insecure = new_insecure;
-
-	memset(new_servers + agent->turn_servers_tls_count, 0, sizeof(juice_turn_server_t));
-	if (copy_turn_server(new_servers + agent->turn_servers_tls_count, turn_server) < 0)
-		return -1;
-	new_insecure[agent->turn_servers_tls_count] = insecure_skip_verify;
-	agent->turn_servers_tls_count = new_count;
-	return 0;
 #endif
 }
 

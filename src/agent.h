@@ -139,13 +139,17 @@ typedef struct agent_stun_entry {
 
 } agent_stun_entry_t;
 
+// TURN server reached over TCP or TLS; UDP servers stay in config.turn_servers
+typedef struct agent_stream_turn_server {
+	juice_turn_server_t server;
+	bool tls;
+	bool tls_insecure; // TLS only: skip certificate validation
+} agent_stream_turn_server_t;
+
 struct juice_agent {
 	juice_config_t config;
-	juice_turn_server_t *turn_servers_tcp;
-	int turn_servers_tcp_count;
-	juice_turn_server_t *turn_servers_tls;
-	int turn_servers_tls_count;
-	bool *turn_servers_tls_insecure; // parallel array to turn_servers_tls, same indexing
+	agent_stream_turn_server_t *stream_turn_servers;
+	int stream_turn_servers_count;
 	juice_state_t state;
 	agent_mode_t mode;
 	juice_ice_tcp_mode_t ice_tcp_mode;
